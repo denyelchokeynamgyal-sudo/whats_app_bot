@@ -1,0 +1,30 @@
+{
+  "name": "hotel-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "AI Hotel Booking WhatsApp Bot with MongoDB",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "clean": "rm -rf .wwebjs_auth .wwebjs_cache",
+    "clean:win": "rmdir /s /q .wwebjs_auth .wwebjs_cache",
+    "reset-db": "node scripts/seed-database.js"
+  },
+  "dependencies": {
+    "date-fns": "^4.1.0",
+    "dotenv": "^16.0.0",
+    "mongoose": "^7.0.0",
+    "openai": "^4.20.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.24.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "hotel",
+    "booking",
+    "mongodb",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT"
+}

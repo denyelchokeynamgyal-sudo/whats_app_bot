@@ -1,0 +1,15 @@
+# Created by codeshack.io
+
+### Node.js ###
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+dist/
+.env
+.DS_Store
+coverage/
+.nyc_output/
+.wwebjs_auth
