@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hotel Booking Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>
+                <i>🏨</i> Hotel Booking Dashboard
+            </h1>
+            <div class="header-info">
+                <div class="backend-info">Backend: Google Sheets</div>
+                <div class="update-info" id="last-update">Last updated: Just now</div>
+            </div>
+        </div>
+
+        <!-- Dashboard Tabs -->
+        <div class="dashboard-tabs">
+            <button class="tab-btn active" data-tab="pending">
+                <i>📋</i> Pending Requests
+            </button>
+            <button class="tab-btn" data-tab="all">
+                <i>📊</i> All Bookings
+            </button>
+            <button class="tab-btn" data-tab="rooms">
+                <i>🏨</i> Room Management
+            </button>
+        </div>
+
+        <!-- PENDING REQUESTS TAB -->
+        <div id="pending-tab" class="tab-content active">
+            <div class="stats">
+                <div class="stat-card">
+                    <h3>Pending Bookings</h3>
+                    <div class="number" id="pending-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Today's Requests</h3>
+                    <div class="number" id="today-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Available Rooms</h3>
+                    <div class="number" id="available-rooms">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Total Revenue Today</h3>
+                    <div class="number" id="today-revenue">Nu.0</div>
+                </div>
+            </div>
+
+            <div class="bookings-container">
+                <div class="bookings-header">
+                    <h2><i>📋</i> Pending Booking Requests</h2>
+                    <button class="refresh-btn" id="refresh-pending">
+                        <i>🔄</i> Refresh
+                    </button>
+                </div>
+
+                <div id="pending-bookings-list">
+                    <div class="no-bookings">
+                        <i>📭</i>
+                        <h3>Loading pending bookings...</h3>
+                        <p>Fetching data from Google Sheets</p>
+                    </div>
+                </div>
+
+                <div class="auto-refresh">
+                    <i>⏱️</i> Auto-refreshing every 30 seconds
+                </div>
+            </div>
+        </div>
+
+        <!-- TODAY'S ACTIVITIES TAB -->
+        <div id="today-tab" class="tab-content">
+            <div class="stats">
+                <div class="stat-card">
+                    <h3>Today's Check-ins</h3>
+                    <div class="number" id="today-checkins-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Today's Check-outs</h3>
+                    <div class="number" id="today-checkouts-count">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Today's Revenue</h3>
+                    <div class="number" id="today-revenue-tab">Nu.0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Occupancy Rate</h3>
+                    <div class="number" id="occupancy-rate">0%</div>
+                </div>
+            </div>
+
+            <div class="bookings-container">
+                <div class="bookings-header">
+                    <h2><i>📅</i> Today's Activities</h2>
+                    <button class="refresh-btn" id="refresh-today">
+                        <i>🔄</i> Refresh
+                    </button>
+                </div>
+
+                <div class="today-grid">
+                    <div class="today-section">
+                        <h3><i>✅</i> Today's Check-ins</h3>
+                        <div id="checkins-list">
+                            <div class="no-bookings" style="padding: 20px;">
+                                <p>Loading check-ins...</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="today-section">
+                        <h3><i>🚪</i> Today's Check-outs</h3>
+                        <div id="checkouts-list">
+                            <div class="no-bookings" style="padding: 20px;">
+                                <p>Loading check-outs...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ALL BOOKINGS TAB -->
+        <div id="all-tab" class="tab-content">
+            <div class="bookings-container">
+                <div class="bookings-header">
+                    <h2><i>📊</i> All Bookings</h2>
+                    <div class="filter-container">
+                        <select id="status-filter">
+                            <option value="">All Status</option>
+                            <option value="requested">Requested</option>
+                            <option value="confirmed">Confirmed</option>
+                            <option value="checked_in">Checked In</option>
+                            <option value="checked_out">Checked Out</option>
+                            <option value="cancelled">Cancelled</option>
+                        </select>
+                        <button class="refresh-btn" id="refresh-all">
+                            <i>🔄</i> Refresh
+                        </button>
+                    </div>
+                </div>
+
+                <div id="all-bookings-list">
+                    <div class="no-bookings">
+                        <i>📊</i>
+                        <h3>No bookings found</h3>
+                        <p>Apply different filters or check back later</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ROOM MANAGEMENT TAB -->
+        <div id="rooms-tab" class="tab-content">
+            <div class="bookings-container">
+                <div class="bookings-header">
+                    <h2><i>🏨</i> Room Management</h2>
+                    <button class="refresh-btn" id="refresh-rooms">
+                        <i>🔄</i> Refresh Rooms
+                    </button>
+                </div>
+
+                <div class="rooms-grid" id="rooms-list">
+                    <div class="no-bookings">
+                        <i>🏨</i>
+                        <h3>Loading rooms...</h3>
+                        <p>Fetching room information from Google Sheets</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+    <style src="styles.css"></style>
+</body>
+
+</html>

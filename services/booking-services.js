@@ -1,33 +1,94 @@
-const Room = require('../models/Room');
-const Booking = require('../models/Booking');
-const Customer = require('../models/Customer');
+// services/booking-services.js - UPDATED EXPORT
+const GoogleSheetsService = require('./google-sheets-service');
 
 class BookingService {
 
-    // Check room availability
+    constructor() {
+        this.GoogleSheets = new GoogleSheetsService();
+    }
     async checkAvailability(roomType, checkInDate, nights = 1) {
+        return await this.GoogleSheets.checkAvailability(roomType, checkInDate, nights);
+    }
+    async getAllRoomsWithAvailability(checkInDate = null, nights = 1) {
+        return await this.GoogleSheets.getAllRoomsWithAvailability(checkInDate, nights);
+    }
+    async createBooking(bookingData) {
+        return await this.GoogleSheets.createBookingRequest(bookingData);
+    }
+    async getPendingBookings() {
+        return await this.GoogleSheets.getPendingBookings();
+    }
+    async approveBooking(bookingId, employeeName = 'Staff') {
+        return await this.GoogleSheets.approveBooking(bookingId, employeeName);
+    }
+    async getAllRooms() {
+        return await this.GoogleSheets.getAllRooms();
+    }
+
+    async getAllBookings(status = null) {
         try {
-            const room = await Room.findOne({ name: roomType });
-
-            if (!room) {
-                return { available: false, message: 'Room type not found' };
-            }
-
-            const isAvailable = room.isAvailable(checkInDate, nights);
-            const availableCount = room.getAvailableCountForRange(checkInDate, nights);
-
-            return {
-                available: isAvailable,
-                availableCount,
-                room,
-                message: isAvailable
-                    ? `✅ Available! ${availableCount} ${roomType}(s) free for those dates.`
-                    : `❌ Not available. Only ${availableCount} ${roomType}(s) left for ${checkInDate}.`
-            };
+            return await this.GoogleSheets.getAllBookings({ status: status });
         } catch (error) {
-            console.error('Error checking availability:', error);
+            console.error('Error getting all bookings:', error);
+            return [];
+        }
+    }
+    async cancelBooking(bookingId, reason = 'Cancelled by staff') {
+        console.log(`📝 [BookingService] Cancelling booking ${bookingId}`);
+
+        try {
+            // Delegate to GoogleSheetsService.cancelBooking
+            return await this.GoogleSheets.cancelBooking(bookingId, reason);
+        } catch (error) {
+            console.error('❌ [BookingService] Error cancelling booking:', error);
             throw error;
         }
+    }
+
+    async checkInBooking(bookingId, checkInTime = new Date()) {
+        try {
+            return await this.GoogleSheets.checkInBooking(bookingId, checkInTime);
+        } catch (error) {
+            console.error('Error checking in:', error);
+            throw error;
+        }
+    }
+    async checkOutBooking(bookingId, checkOutTime = new Date()) {
+        try {
+            return await this.GoogleSheets.checkOutBooking(bookingId, checkOutTime);
+        } catch (error) {
+            console.error('Error checking out:', error);
+            throw error;
+        }
+    }
+    async getBookings(filters = {}) {
+        try {
+            return await this.GoogleSheets.getAllBookings(filters);
+        } catch (error) {
+            console.error('Error getting bookings:', error);
+            return [];
+        }
+    }
+
+    async autoCheckoutExpiredBookings() {
+        try {
+            return await this.GoogleSheets.autoCheckoutExpiredBookings();
+        } catch (error) {
+            console.error('Error in auto-checkout:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    async getTodayCheckIns() {
+        const today = new Date().toISOString().split('T')[0];
+        const allBookings = await this.getBookings({ status: 'confirmed' });
+        return allBookings.filter(b => b.checkInDate === today);
+    }
+
+    async getTodayCheckOuts() {
+        const today = new Date().toISOString().split('T')[0];
+        const allBookings = await this.getBookings({ status: 'checked_in' });
+        return allBookings.filter(b => b.checkOutDate === today);
     }
 
     validateBookingInput({ roomType, checkInDate, nights, guests }) {
@@ -55,215 +116,23 @@ class BookingService {
             throw new Error('Invalid number of guests');
         }
     }
-
-
-    // Create booking - AUTO-UPDATES DATABASE
-    async createBooking(bookingData) {
-        const session = await Room.startSession();
-        session.startTransaction();
-
+    async createBookingRequest(bookingData) {
         try {
-            const {
-                customerPhone,
-                customerName,
-                roomType,
-                checkInDate,
-                nights,
-                guests,
-                specialRequests
-            } = bookingData;
+            const { nights = 1, ...rest } = bookingData;
 
-            this.validateBookingInput({ roomType, checkInDate, nights, guests });
+            const validatedNights = Math.max(1, Math.min(30, parseInt(nights) || 1));
 
-
-
-
-            // 1. Check availability
-            const availability = await this.checkAvailability(roomType, checkInDate, nights);
-
-            if (!availability.available) {
-                throw new Error(availability.message);
-            }
-
-            const room = availability.room;
-            const totalAmount = room.pricePerNight * nights;
-
-            // 2. Generate booking ID
-            const bookingId = Booking.generateBookingId();
-
-            // 3. Create booking record
-            const checkOutDate = this.calculateCheckOutDate(checkInDate, nights);
-
-            const booking = new Booking({
-                bookingId,
-                customerPhone,
-                customerName,
-                roomType,
-                roomId: room._id,
-                checkInDate,
-                checkOutDate,
-                nights,
-                guests,
-                totalAmount,
-                specialRequests,
-                status: 'confirmed'
-            });
-
-            // 4. AUTO-UPDATE: Book the room dates with session
-            await room.bookRoom(booking._id, customerPhone, checkInDate, nights, session);
-
-            // 5. Save booking with session
-            await booking.save({ session });
-
-            // 6. Update customer record with session
-            await this.updateCustomerRecord(customerPhone, customerName, totalAmount, session);
-
-
-            // 7. Commit transaction
-            await session.commitTransaction();
-            session.endSession();
-
-            console.log(`✅ Booking created: ${bookingId}. Room availability updated.`);
-
-            return {
-                success: true,
-                booking,
-                message: `Booking confirmed! ID: ${bookingId}`
+            const bookingDataWithFixedNights = {
+                ...rest,
+                nights: validatedNights
             };
 
+            return await this.GoogleSheets.createBookingRequest(bookingDataWithFixedNights);
         } catch (error) {
-            // Rollback on error
-            await session.abortTransaction();
-            session.endSession();
-
-            console.error('Booking failed:', error.message);
+            console.error('Error creating booking request:', error);
             throw error;
         }
     }
-
-    // Calculate check-out date
-    calculateCheckOutDate(checkInDate, nights) {
-        const date = new Date(checkInDate);
-        date.setDate(date.getDate() + nights);
-        return date;
-    }
-
-    // Update customer record
-    async updateCustomerRecord(phone, name, amount, session = null) {
-        try {
-            const customer = await Customer.findOneAndUpdate(
-                { phone },
-                {
-                    $set: { name, lastBookingDate: new Date() },
-                    $inc: {
-                        totalBookings: 1,
-                        totalSpent: amount
-                    }
-                },
-                {
-                    upsert: true,
-                    new: true
-                }
-            );
-            return customer;
-        } catch (error) {
-            console.error('Error updating customer:', error);
-        }
-    }
-
-    // Cancel booking - AUTO-UPDATES availability
-    async cancelBooking(bookingId) {
-        const session = await Room.startSession();
-        session.startTransaction();
-
-        try {
-            // 1. Find booking
-            const booking = await Booking.findOne({ bookingId });
-            if (!booking) {
-                throw new Error('Booking not found');
-            }
-
-            // 2. Find room
-            const room = await Room.findById(booking.roomId);
-            if (!room) {
-                throw new Error('Room not found');
-            }
-
-            // 3. AUTO-UPDATE: Remove booked dates
-            await room.cancelBooking(booking._id, session);
-
-            // 4. Update booking status
-            booking.status = 'cancelled';
-            booking.paymentStatus = 'refunded';
-            await booking.save();
-
-            // 5. Commit
-            await session.commitTransaction();
-            session.endSession();
-
-            console.log(`✅ Booking cancelled: ${bookingId}. Room availability restored.`);
-
-            return {
-                success: true,
-                message: `Booking ${bookingId} cancelled successfully.`
-            };
-
-        } catch (error) {
-            await session.abortTransaction();
-            session.endSession();
-            throw error;
-        }
-    }
-
-    // Get all rooms with real-time availability
-    // Get all rooms with real-time availability
-async getAllRoomsWithAvailability(checkInDate, nights = 1) {
-    try {
-        const rooms = await Room.find({ isActive: true });
-        
-        // Validate and set default date if needed
-        let dateToUse;
-        if (checkInDate && !isNaN(new Date(checkInDate).getTime())) {
-            dateToUse = new Date(checkInDate);
-        } else {
-            dateToUse = new Date(); // Default to today
-        }
-        
-        // Format as YYYY-MM-DD
-        const formattedDate = dateToUse.toISOString().split('T')[0];
-
-        const roomsWithAvailability = await Promise.all(
-            rooms.map(async (room) => {
-                try {
-                    const availableCount = room.getAvailableCountForRange(formattedDate, nights);
-                    const isAvailable = room.isAvailable(formattedDate, nights);
-
-                    return {
-                        ...room.toObject(),
-                        availableCount,
-                        isAvailable,
-                        availableText: isAvailable
-                            ? `✅ ${availableCount} available`
-                            : `❌ Only ${availableCount} left`
-                    };
-                } catch (error) {
-                    console.error(`Error processing room ${room.name}:`, error.message);
-                    return {
-                        ...room.toObject(),
-                        availableCount: 0,
-                        isAvailable: false,
-                        availableText: '❌ Error checking availability'
-                    };
-                }
-            })
-        );
-
-        return roomsWithAvailability;
-    } catch (error) {
-        console.error('Error in getAllRoomsWithAvailability:', error);
-        return [];
-    }
-}
 }
 
-module.exports = new BookingService();
+module.exports = BookingService;  

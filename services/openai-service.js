@@ -1,6 +1,7 @@
 const OpenAI = require('openai');
 require('dotenv').config();
-const { parse, format, isValid } = require('date-fns');
+const { parse, format, isValid, addDays } = require('date-fns');
+
 
 class OpenAIService {
     constructor(bookingService) {
@@ -14,6 +15,7 @@ class OpenAIService {
 
         this.bookingService = bookingService;
         this.conversationHistory = new Map();
+        this.bookingIntents = new Map();
 
         this.hotelInfo = {
             name: process.env.DEFAULT_HOTEL_NAME || 'Jaggle AI',
@@ -24,569 +26,751 @@ class OpenAIService {
             checkOutTime: process.env.DEFAULT_CHECK_OUT_TIME || '12:00 PM',
             amenities: process.env.DEFAULT_AMENITIES
                 ? process.env.DEFAULT_AMENITIES.split(',')
-                : ['Free WiFi', 'Swimming Pool', 'Spa', '24/7 Room Service', 'Airport Pickup']
+                : ['Free WiFi']
         };
+
+        console.log('✅ OpenAI Service initialized');
     }
 
-    /** Helper: parse user-friendly date to YYYY-MM-DD safely */
-    /** Helper: parse user-friendly date to YYYY-MM-DD safely */
     parseDate(userDate) {
         try {
             const today = new Date();
-            if (!userDate || userDate.trim() === '') return today.toISOString().split('T')[0];
+            const currentYear = today.getFullYear();
+            const currentMonth = today.getMonth();
+            const currentDay = today.getDate();
 
-            // Clean up the input
+            if (!userDate || userDate.trim() === '') {
+                return format(today, 'yyyy-MM-dd');
+            }
+
             const cleanedDate = userDate.trim().toLowerCase();
+            console.log('Parsing date:', cleanedDate);
 
             // Handle common relative dates
             if (cleanedDate === 'today' || cleanedDate === 'now') {
-                return today.toISOString().split('T')[0];
+                return format(today, 'yyyy-MM-dd');
             }
 
             if (cleanedDate === 'tomorrow') {
                 const tomorrow = new Date(today);
                 tomorrow.setDate(tomorrow.getDate() + 1);
-                return tomorrow.toISOString().split('T')[0];
+                return format(tomorrow, 'yyyy-MM-dd');
             }
 
-            // Remove any time component if present
-            const dateOnly = cleanedDate.split(' ')[0];
+            if (cleanedDate === 'day after tomorrow') {
+                const dayAfter = new Date(today);
+                dayAfter.setDate(dayAfter.getDate() + 2);
+                return format(dayAfter, 'yyyy-MM-dd');
+            }
 
-            // Try parsing as ISO date first (YYYY-MM-DD)
-            if (/^\d{4}-\d{2}-\d{2}$/.test(dateOnly)) {
-                const parsed = new Date(dateOnly);
-                if (!isNaN(parsed.getTime())) {
-                    return format(parsed, 'yyyy-MM-dd');
+            // Try to parse as day number (like "24")
+            if (/^\d{1,2}$/.test(cleanedDate)) {
+                const day = parseInt(cleanedDate);
+                const currentDate = new Date(currentYear, currentMonth, day);
+
+                // If day is in the past, assume next month
+                if (currentDate < today) {
+                    currentDate.setMonth(currentMonth + 1);
                 }
+
+                return format(currentDate, 'yyyy-MM-dd');
             }
 
-            // Try parsing with date-fns formats
-            const currentYear = today.getFullYear();
-            let parsed;
+            // Try parsing with various formats
+            let parsedDate;
 
-            // Add more formats to try
-            const formatsToTry = [
-                'd MMMM yyyy',
-                'd MMMM',
+            // Try common date formats
+            const formats = [
                 'yyyy-MM-dd',
                 'dd/MM/yyyy',
                 'MM/dd/yyyy',
+                'd MMMM yyyy',
+                'd MMM yyyy',
                 'MMMM d, yyyy',
-                'MMM d, yyyy'
+                'MMM d, yyyy',
+                'd-M-yyyy',
+                'd/M/yyyy'
             ];
 
-            for (let fmt of formatsToTry) {
+            for (const fmt of formats) {
                 try {
-                    parsed = parse(dateOnly, fmt, new Date());
-                    if (isValid(parsed)) {
-                        // If year wasn't specified, use current year
-                        if (!/(\d{4})/.test(dateOnly)) {
-                            parsed.setFullYear(currentYear);
-                        }
-                        return format(parsed, 'yyyy-MM-dd');
+                    parsedDate = parse(cleanedDate, fmt, new Date());
+                    if (isValid(parsedDate)) {
+                        return format(parsedDate, 'yyyy-MM-dd');
                     }
                 } catch (e) {
-                    // Try next format
                     continue;
                 }
             }
 
-            // Fallback: use today's date
+            // Fallback: assume today
             console.warn(`Could not parse date: "${userDate}". Using today's date.`);
-            return today.toISOString().split('T')[0];
+            return format(today, 'yyyy-MM-dd');
 
         } catch (error) {
             console.error('Error parsing date:', error.message, 'Input:', userDate);
-            return new Date().toISOString().split('T')[0];
+            return format(new Date(), 'yyyy-MM-dd');
         }
     }
 
     async getAIResponse(phoneNumber, userMessage) {
-    try {
-        console.log(`🤖 AI Request for ${phoneNumber}: ${userMessage}`);
-        
-        if (!this.conversationHistory.has(phoneNumber)) {
-            this.conversationHistory.set(phoneNumber, []);
+        try {
+            // Initialize conversation history for this phone number
+            if (!this.conversationHistory.has(phoneNumber)) {
+                this.conversationHistory.set(phoneNumber, []);
+            }
+            const history = this.conversationHistory.get(phoneNumber);
+
+            // Add user message to history
+            history.push({ role: 'user', content: userMessage });
+
+            // Keep history manageable (last 15 messages)
+            if (history.length > 15) {
+                history.splice(0, history.length - 15);
+            }
+
+            // Get current room availability
+            const rooms = await this.bookingService.getAllRoomsWithAvailability();
+            const roomOptions = rooms.map(room =>
+                `${room.name} (Nu.${room.pricePerNight}/night, ${room.availableCount} available)`
+            ).join(', ');
+
+            console.log(`📊 Room availability loaded: ${rooms.length} room types`);
+
+            // First, check if we should create a booking request
+            if (this.shouldCreateBookingRequest(phoneNumber, userMessage)) {
+                console.log(`🔍 Should create booking request for ${phoneNumber}`);
+
+                // Extract booking details, allowing updates from user corrections
+                const bookingDetails = await this.extractBookingDetails(phoneNumber, userMessage);
+
+                if (bookingDetails &&
+                    bookingDetails.customerName &&
+                    bookingDetails.roomType &&
+                    bookingDetails.checkInDate) {
+
+                    try {
+                        // Format phone for display
+                        let displayPhone;
+                        if (phoneNumber.startsWith('91') && phoneNumber.length === 12) {
+                            displayPhone = `+91 ${phoneNumber.substring(2, 7)} ${phoneNumber.substring(7)}`;
+                        } else if (phoneNumber.startsWith('975') && phoneNumber.length === 11) {
+                            displayPhone = `+975 ${phoneNumber.substring(3, 7)} ${phoneNumber.substring(7)}`;
+                        } else if (phoneNumber.length === 10) {
+                            displayPhone = `+91 ${phoneNumber.substring(0, 5)} ${phoneNumber.substring(5)}`;
+                        } else {
+                            displayPhone = `+${phoneNumber}`;
+                        }
+
+                        // Create booking request with latest details
+                        const result = await this.bookingService.createBookingRequest({
+                            ...bookingDetails,
+                            customerPhone: phoneNumber,
+                            status: 'requested'
+                        });
+
+                        if (result.success) {
+                            this.clearHistory(phoneNumber);
+                            this.bookingIntents.delete(phoneNumber);
+
+                            const confirmationMessage = `🎉 *THANK YOU FOR YOUR BOOKING REQUEST!* 🎉
+
+    📋 *Request Details:*
+    • 📝 Request ID: *${result.booking.bookingId}*
+    • 👤 Name: *${bookingDetails.customerName}*
+    • 🏨 Room: *${bookingDetails.roomType}*
+    • 🗓️ Check-in: *${bookingDetails.checkInDate}* (${bookingDetails.nights} night${bookingDetails.nights > 1 ? 's' : ''})
+    • 📅 Check-out: *${bookingDetails.checkOutDate}*
+    • 👥 Guests: *${bookingDetails.guests}*
+    • 💰 Total: *Nu.${result.booking.totalAmount}*
+
+    📞 *Next Steps:*
+    1. Our staff will call you at *${displayPhone}* within *30 minutes*
+    2. We'll confirm availability and take payment
+    3. You'll receive final confirmation via WhatsApp
+
+    ⏰ *Check-in Time:* ${this.hotelInfo.checkInTime}
+    🏨 *Hotel:* ${this.hotelInfo.name}
+    📍 *Location:* ${this.hotelInfo.location}
+
+    *Special Requests:* ${bookingDetails.specialRequests || 'None'}
+
+    Thank you for choosing ${this.hotelInfo.name}! We look forward to hosting you! 🏨✨`;
+
+                            history.push({ role: 'assistant', content: confirmationMessage });
+                            return confirmationMessage;
+                        } else {
+                            const errorMessage = `❌ *Booking Request Failed*
+    Sorry, we couldn't process your booking request at this time.
+
+    Please contact us directly:
+    📞 ${this.hotelInfo.contactPhone}
+    📧 ${this.hotelInfo.contactEmail}
+
+    Or try again in a few minutes.`;
+
+                            history.push({ role: 'assistant', content: errorMessage });
+                            return errorMessage;
+                        }
+                    } catch (bookingError) {
+                        console.error('❌ Booking creation error:', bookingError);
+
+                        const errorMessage = `❌ *Booking Request Issue*
+    ${bookingError.message || 'Sorry, we encountered an issue with your booking request.'}
+
+    Please contact us directly:
+    📞 ${this.hotelInfo.contactPhone}
+
+    Or try different dates/room types.`;
+
+                        history.push({ role: 'assistant', content: errorMessage });
+                        return errorMessage;
+                    }
+                }
+            }
+
+            // For simple greetings, use pre-defined responses
+            const lowerMessage = userMessage.toLowerCase();
+            if (lowerMessage.includes('hello') || lowerMessage.includes('hi') ||
+                lowerMessage.includes('hey') || lowerMessage === 'hi' ||
+                lowerMessage === 'hello' || lowerMessage.includes('how are you')) {
+
+                const greetingResponse = `Hello! 👋 Welcome to ${this.hotelInfo.name}! 
+
+    I'm your AI booking assistant. Here's what I can help you with:
+    🏨 Book a room
+    📅 Check availability  
+    💰 Get price quotes
+    ❓ Answer questions
+
+    Available rooms:
+    ${rooms.map(r => `• ${r.name}: Nu.${r.pricePerNight}/night (${r.availableCount} available)`).join('\n')}
+
+    How can I assist you today?`;
+
+                history.push({ role: 'assistant', content: greetingResponse });
+                return greetingResponse;
+            }
+
+            // For booking-related queries or general conversation, use AI
+            try {
+                // Prepare the conversation context
+                const recentHistory = history.slice(-10); // Last 10 messages for context
+
+                // System prompt with hotel information
+                const systemPrompt = `You are a helpful hotel booking assistant for ${this.hotelInfo.name} hotel in ${this.hotelInfo.location}.
+
+    Available rooms with prices:
+    ${rooms.map(room => `- ${room.name}: Nu.${room.pricePerNight} per night (Currently ${room.availableCount} available)`).join('\n')}
+
+    Hotel Information:
+    - Check-in time: ${this.hotelInfo.checkInTime}
+    - Check-out time: ${this.hotelInfo.checkOutTime}
+    - Contact: ${this.hotelInfo.contactPhone}
+    - Amenities: ${this.hotelInfo.amenities.join(', ')}
+
+    IMPORTANT INSTRUCTIONS:
+    1. Be friendly, professional, and helpful
+    2. If user wants to book, guide them step by step:
+    a. Ask for room type (Single/Double/Suite)
+    b. Ask for check-in date (tomorrow, today, specific date)
+    c. Ask for number of nights
+    d. Ask for number of guests
+    e. Ask for their name
+    3. Ask ONE question at a time, don't overwhelm with multiple questions
+    4. Once all information is collected, summarize and ask them to type "Confirm" to proceed
+    5. For other questions, answer concisely and helpfully
+    6. Always mention that staff will call to confirm the booking
+    7. If user provides any booking details, acknowledge and continue with next question
+
+    Current conversation history (last few messages):`;
+
+                // Build messages for AI
+                const messages = [
+                    { role: "system", content: systemPrompt },
+                    ...recentHistory
+                ];
+
+                console.log(`🤖 Calling AI with ${messages.length} messages for ${phoneNumber}`);
+
+                const completion = await this.openai.chat.completions.create({
+                    model: "gpt-4.1-mini",
+                    messages: messages,
+                    temperature: 0.7,
+                    max_tokens: 300
+                });
+
+                const aiResponse = completion.choices[0].message.content;
+
+                // Add AI response to history
+                history.push({ role: 'assistant', content: aiResponse });
+
+                console.log(`✅ AI Response generated (${aiResponse.length} chars)`);
+                return aiResponse;
+
+            } catch (aiError) {
+                console.error('❌ AI generation error:', aiError);
+
+                // Fallback to simple responses
+                const fallbackResponse = await this.getFallbackResponse(userMessage, rooms);
+                history.push({ role: 'assistant', content: fallbackResponse });
+                return fallbackResponse;
+            }
+
+        } catch (error) {
+            console.error('❌ Error in getAIResponse:', error);
+
+            // Ultimate fallback response
+            const errorResponse = `😅 Sorry, something went wrong while processing your request. 
+
+    Please try again or contact us directly:
+    📞 ${this.hotelInfo.contactPhone}
+    📧 ${this.hotelInfo.contactEmail}
+
+    Thank you for your patience!`;
+
+            return errorResponse;
         }
-        const history = this.conversationHistory.get(phoneNumber);
+    }
 
-        history.push({ role: 'user', content: userMessage });
+    // Helper method for fallback responses (keep your existing getFallbackResponse but update it)
+    async getFallbackResponse(userMessage, rooms = []) {
+        const lowerMessage = userMessage.toLowerCase();
 
-        if (history.length > 20) history.splice(0, history.length - 20);
+        // If rooms not provided, fetch them
+        if (rooms.length === 0) {
+            try {
+                rooms = await this.bookingService.getAllRoomsWithAvailability();
+            } catch (error) {
+                console.error('Error getting rooms for fallback:', error);
+            }
+        }
 
-        // Get rooms with default date (today)
-        const rooms = await this.bookingService.getAllRoomsWithAvailability();
-        
-        console.log(`📊 Retrieved ${rooms.length} rooms from database`);
+        const roomList = rooms.map(r => `• ${r.name}: Nu.${r.pricePerNight}/night (${r.availableCount} available)`).join('\n');
 
-        const roomInfo = rooms
-            .filter(room => room.availableCount > 0)
-            .map(room => `${room.name}: ₹${room.pricePerNight}/night (${room.availableCount} available)`)
-            .join('\n');
+        if (lowerMessage.includes('book') || lowerMessage.includes('room') || lowerMessage.includes('stay')) {
+            return `I'd be happy to help you book a room! 🏨
 
-        // Create a simple prompt for basic responses
-        const systemPrompt = `You are ${this.hotelInfo.name}'s WhatsApp booking assistant. 
-You have access to real-time room availability from our database.
+    Available rooms:
+    ${roomList}
 
-Current Available Rooms:
-${roomInfo}
+    To make a booking, I need a few details. Could you tell me:
+    1. Which room type you'd like?
+    2. What's your check-in date?`;
+        }
 
-Hotel Info:
-Name: ${this.hotelInfo.name}
-Location: ${this.hotelInfo.location}
-Contact: ${this.hotelInfo.contactPhone}
+        if (lowerMessage.includes('price') || lowerMessage.includes('cost') || lowerMessage.includes('how much')) {
+            return `💰 Room Prices (per night):
+    ${roomList}
 
-Respond to the user in a friendly, helpful way. If they want to book or check availability, ask for details.`;
+    Would you like to book one of these rooms?`;
+        }
 
-        const messages = [
-            { role: 'system', content: systemPrompt },
-            ...history.slice(-8)
+        if (lowerMessage.includes('available') || lowerMessage.includes('vacant')) {
+            return `✅ Current Availability:
+    ${roomList}
+
+    Which room interests you?`;
+        }
+
+        if (lowerMessage.includes('amenities') || lowerMessage.includes('facilities')) {
+            return `⭐ Hotel Amenities:
+    ${this.hotelInfo.amenities.map(a => `• ${a}`).join('\n')}
+
+    ⏰ Check-in: ${this.hotelInfo.checkInTime}
+    ⏰ Check-out: ${this.hotelInfo.checkOutTime}
+    📍 ${this.hotelInfo.location}`;
+        }
+
+        return `Hello! I'm the booking assistant for ${this.hotelInfo.name}. 🏨
+
+    I can help you with:
+    • Booking rooms
+    • Checking availability
+    • Price information
+    • Hotel details
+
+    Available rooms:
+    ${roomList}
+
+    How can I help you today?`;
+    }
+
+
+    extractFromConversation(conversation, keywords) {
+        const lowerConversation = conversation.toLowerCase();
+        if (keywords.includes('single room') || keywords.includes('double room') || keywords.includes('suite')) {
+            if (lowerConversation.includes('single')) return 'Single Room';
+            if (lowerConversation.includes('double')) return 'Double Room';
+            if (lowerConversation.includes('suite')) return 'Suite';
+        }
+
+        // Handle check-in date keywords
+        if (keywords.includes('tomorrow') || keywords.includes('today') || keywords.includes('check-in')) {
+            if (lowerConversation.includes('tomorrow')) return 'tomorrow';
+            if (lowerConversation.includes('today')) return 'today';
+            if (lowerConversation.includes('check-in')) {
+                const dateMatch = lowerConversation.match(/check-in.*?(\d{4}-\d{2}-\d{2}|tomorrow|today)/);
+                if (dateMatch) return dateMatch[1];
+            }
+        }
+
+        // Handle nights
+        if (keywords.includes('night') || keywords.includes('nights') || keywords.includes('stay')) {
+            const nightMatch = lowerConversation.match(/(\d+)\s*(?:night|nights|stay)/i);
+            if (nightMatch) return nightMatch[1];
+        }
+
+        // Handle guests
+        if (keywords.includes('guest') || keywords.includes('guests') || keywords.includes('people')) {
+            const guestMatch = lowerConversation.match(/(\d+)\s*(?:guest|guests|people|person)/i);
+            if (guestMatch) return guestMatch[1];
+        }
+
+        // Handle name
+        if (keywords.includes('name') || keywords.includes('call me') || keywords.includes('i am')) {
+            const nameMatch = conversation.match(/name is\s+([^\.\?!,]+)/i) ||
+                conversation.match(/i am\s+([^\.\?!,]+)/i) ||
+                conversation.match(/call me\s+([^\.\?!,]+)/i);
+            if (nameMatch && nameMatch[1]) {
+                return nameMatch[1].trim();
+            }
+        }
+
+        return null;
+    }
+
+    getMissingInfoPrompt(collectedInfo) {
+        const steps = [
+            { key: 'roomType', label: 'Room type (Single/Double/Suite)', done: !!collectedInfo.roomType },
+            { key: 'checkInDate', label: 'Check-in date', done: !!collectedInfo.checkInDate },
+            { key: 'nights', label: 'Number of nights', done: !!collectedInfo.nights },
+            { key: 'guests', label: 'Number of guests', done: !!collectedInfo.guests },
+            { key: 'name', label: 'Customer name', done: !!collectedInfo.name }
         ];
 
-        console.log('🤖 Sending request to OpenAI...');
-        
-        // First, try a simple response without tools to test
-        const completion = await this.openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: messages,
-            temperature: 0.6,
-            max_tokens: 300
-        });
+        const missingSteps = steps.filter(step => !step.done);
 
-        const response = completion.choices[0].message.content;
-        
-        // Add response to history
-        history.push({ role: 'assistant', content: response });
-        
-        // If response is getting too long, trim it
-        if (history.length > 10) {
-            history.splice(0, history.length - 10);
+        if (missingSteps.length === 0) {
+            return "ALL INFORMATION COLLECTED. Summarize all details and ask user to type 'Confirm' to proceed.";
         }
 
-        console.log(`✅ AI Response generated: ${response.substring(0, 100)}...`);
-        return response;
-
-    } catch (error) {
-        console.error('❌ OpenAI Error:', error.message);
-        
-        // Fallback responses based on user message
-        const lowerMessage = userMessage.toLowerCase();
-        
-        if (lowerMessage.includes('hello') || lowerMessage.includes('hi') || lowerMessage.includes('hey')) {
-            return `Hello! 👋 Welcome to ${this.hotelInfo.name}! I'm your booking assistant. I can help you with:
-• Checking room availability
-• Making bookings
-• Hotel information
-• Pricing queries
-
-How can I assist you today? 🏨`;
-        }
-        
-        if (lowerMessage.includes('book') || lowerMessage.includes('reservation')) {
-            const rooms = await this.bookingService.getAllRoomsWithAvailability();
-            const availableRooms = rooms.filter(r => r.availableCount > 0);
-            
-            if (availableRooms.length === 0) {
-                return `📅 I'd love to help you book! Currently, all rooms are booked. Please check back later or contact us at ${this.hotelInfo.contactPhone}.`;
-            }
-            
-            const roomList = availableRooms.map(r => `• ${r.name} - ₹${r.pricePerNight}/night (${r.availableCount} available)`).join('\n');
-            
-            return `📅 Great! I can help you make a booking. Here are our available rooms:\n\n${roomList}\n\nTo book, please provide:\n1. Your full name\n2. Room type\n3. Check-in date (YYYY-MM-DD format)\n4. Number of nights\n5. Number of guests`;
-        }
-        
-        if (lowerMessage.includes('available') || lowerMessage.includes('rooms')) {
-            const rooms = await this.bookingService.getAllRoomsWithAvailability();
-            const availableRooms = rooms.filter(r => r.availableCount > 0);
-            
-            if (availableRooms.length === 0) {
-                return `🏨 Currently, all rooms are booked. Please try different dates or contact us at ${this.hotelInfo.contactPhone}.`;
-            }
-            
-            const roomList = availableRooms.map(r => `• ${r.name} - ₹${r.pricePerNight}/night (${r.availableCount} available)`).join('\n');
-            
-            return `🏨 AVAILABLE ROOMS (Real-time from database):\n\n${roomList}\n\nWould you like to book any of these rooms?`;
-        }
-        
-        if (lowerMessage.includes('price') || lowerMessage.includes('cost')) {
-            const rooms = await this.bookingService.getAllRoomsWithAvailability();
-            const roomList = rooms.map(r => `• ${r.name}: ₹${r.pricePerNight}/night`).join('\n');
-            
-            return `💰 OUR ROOM PRICES (per night):\n\n${roomList}\n\nFor a total price calculation, please let me know:\n1. Which room type\n2. Number of nights\n3. Number of guests`;
-        }
-        
-        // Default fallback
-        return `Hello! I'm having some technical difficulties with my AI system. 😅
-
-But I can still help you with:
-• Room availability
-• Booking information
-• Hotel details
-
-Please contact us directly at ${this.hotelInfo.contactPhone} for immediate assistance, or try asking in a different way! 🏨`;
+        const nextStep = missingSteps[0];
+        return `NEXT STEP: Ask for ${nextStep.label}`;
     }
-}
 
-    createSystemPrompt(roomInfo) {
-    return `You are ${this.hotelInfo.name}'s friendly and professional WhatsApp booking assistant.
+    async extractBookingDetails(phoneNumber, currentMessage) {
+        try {
+            const history = this.conversationHistory.get(phoneNumber) || [];
+            if (history.length < 2) {
+                return null;
+            }
 
-IMPORTANT - USE REAL DATABASE DATA:
-AVAILABLE ROOMS (REAL-TIME FROM DATABASE - AUTO-UPDATES WHEN BOOKED):
-${roomInfo}
+            // Get conversation text
+            const conversationText = history.map(msg =>
+                `${msg.role === 'user' ? 'Customer' : 'Assistant'}: ${msg.content}`
+            ).join('\n');
 
-HOTEL INFORMATION:
-- Name: ${this.hotelInfo.name}
-- Location: ${this.hotelInfo.location}
-- Contact: ${this.hotelInfo.contactPhone} | ${this.hotelInfo.contactEmail}
-- Check-in: ${this.hotelInfo.checkInTime} | Check-out: ${this.hotelInfo.checkOutTime}
+            console.log('🔍 Extracting booking details from conversation...');
 
-AMENITIES & SERVICES:
-${this.hotelInfo.amenities.map(amenity => `• ${amenity}`).join('\n')}
+            // Manually extract key information first
+            let extractedInfo = {
+                customerName: 'Guest',
+                roomType: 'Single Room',
+                checkInDate: format(addDays(new Date(), 1), 'yyyy-MM-dd'), // Tomorrow
+                nights: 1,
+                guests: 1,
+                specialRequests: 'None'
+            };
 
-CRITICAL RULES:
-1. ALWAYS check REAL availability from the database above before confirming any booking
-2. If a room shows "0 available", it's COMPLETELY BOOKED - suggest other rooms or dates
-3. When someone books, the database AUTOMATICALLY updates room availability
-4. Collect ALL required info before creating booking: name, room type, check-in date, nights, guests
-5. Only confirm booking if room is actually available in database
-6. After booking, inform customer that room count has been updated
+            // Extract from conversation
+            for (const msg of history) {
+                if (msg.role === 'user') {
+                    const content = msg.content.toLowerCase();
 
-AVAILABLE FUNCTIONS (CALL THESE WHEN NEEDED):
-• checkRoomAvailability - Check if a specific room type is available
-• calculatePrice - Calculate total price for a stay
-• createBooking - Create a new booking (requires all details)
-• getHotelInfo - Get hotel details
-• getAllAvailableRooms - List all available rooms
-
-USE THESE FUNCTIONS WHEN:
-- User asks about room availability → use checkRoomAvailability or getAllAvailableRooms
-- User asks about pricing → use calculatePrice
-- User wants to book → use createBooking (after collecting all details)
-- User asks about hotel → use getHotelInfo
-- General greeting → just respond naturally
-
-YOUR TONE:
-- Friendly, professional, helpful
-- Use emojis occasionally (🏨💰✅📅)
-- Be concise for WhatsApp but complete
-- Always ask for their name if you don't have it yet
-- If unsure, ask clarifying questions
-
-Remember: The database updates in REAL-TIME. When a room is booked, it immediately shows less availability for other customers.`;
-}
-    getAvailableTools() {
-    return [
-        {
-            type: "function",
-            function: {
-                name: "checkRoomAvailability",
-                description: "Check REAL availability of specific room types from database",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        roomType: { 
-                            type: "string", 
-                            description: "Type of room to check (e.g., 'Deluxe Room', 'Executive Suite')" 
-                        },
-                        checkInDate: { 
-                            type: "string", 
-                            description: "Check-in date in YYYY-MM-DD format" 
-                        },
-                        nights: { 
-                            type: "integer", 
-                            description: "Number of nights to stay" 
+                    // Extract name
+                    if (content.includes('name is') || content.includes('i am ') || content.includes('call me')) {
+                        const nameMatch = msg.content.match(/name is\s+([^\.,!?]+)/i) ||
+                            msg.content.match(/i am\s+([^\.,!?]+)/i) ||
+                            msg.content.match(/call me\s+([^\.,!?]+)/i);
+                        if (nameMatch && nameMatch[1]) {
+                            extractedInfo.customerName = nameMatch[1].trim();
+                        } else if (msg.content.length < 20 && msg.content.length > 1 && !msg.content.includes(' ')) {
+                            extractedInfo.customerName = msg.content.trim();
                         }
-                    },
-                    required: ["roomType", "checkInDate"]
-                }
-            }
-        },
-        {
-            type: "function",
-            function: {
-                name: "calculatePrice",
-                description: "Calculate total price for a booking",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        roomType: { 
-                            type: "string",
-                            description: "Type of room (e.g., 'Deluxe Room', 'Executive Suite')"
-                        },
-                        nights: { 
-                            type: "integer",
-                            description: "Number of nights"
-                        },
-                        guests: { 
-                            type: "integer",
-                            description: "Number of guests",
-                            default: 2
+                    }
+
+                    if (content.includes('tomorrow')) {
+                        const tomorrow = new Date();
+                        tomorrow.setDate(tomorrow.getDate() + 1);
+                        extractedInfo.checkInDate = format(tomorrow, 'yyyy-MM-dd');
+                    } else if (content.includes('today')) {
+                        extractedInfo.checkInDate = format(new Date(), 'yyyy-MM-dd');
+                    } else if (content.includes('day after')) {
+                        const dayAfter = new Date();
+                        dayAfter.setDate(dayAfter.getDate() + 2);
+                        extractedInfo.checkInDate = format(dayAfter, 'yyyy-MM-dd');
+                    } else if (/\d{1,2}/.test(content)) {
+                        const dayMatch = content.match(/(\d{1,2})/);
+                        if (dayMatch) {
+                            extractedInfo.checkInDate = this.parseDate(dayMatch[1]);
                         }
-                    },
-                    required: ["roomType", "nights"]
-                }
-            }
-        },
-        {
-            type: "function",
-            function: {
-                name: "createBooking",
-                description: "Create a new booking - AUTOMATICALLY UPDATES DATABASE",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        customerName: { 
-                            type: "string", 
-                            description: "Full name of the customer" 
-                        },
-                        customerPhone: { 
-                            type: "string", 
-                            description: "Phone number of the customer" 
-                        },
-                        roomType: { 
-                            type: "string", 
-                            description: "Type of room to book" 
-                        },
-                        checkInDate: { 
-                            type: "string", 
-                            description: "Check-in date in YYYY-MM-DD format" 
-                        },
-                        nights: { 
-                            type: "integer", 
-                            description: "Number of nights" 
-                        },
-                        guests: { 
-                            type: "integer", 
-                            description: "Number of guests",
-                            default: 2
-                        },
-                        specialRequests: { 
-                            type: "string", 
-                            description: "Any special requests or notes" 
+                    }
+
+                    if (content.includes('night') || content.includes('stay')) {
+                        const nightMatch = content.match(/(\d+)\s*(?:night|nights|stay)/i);
+                        if (nightMatch) {
+                            extractedInfo.nights = parseInt(nightMatch[1]) || 1;
                         }
-                    },
-                    required: ["customerName", "customerPhone", "roomType", "checkInDate", "nights"]
-                }
-            }
-        },
-        {
-            type: "function",
-            function: {
-                name: "getHotelInfo",
-                description: "Get general hotel information",
-                parameters: {
-                    type: "object",
-                    properties: {}
-                }
-            }
-        },
-        {
-            type: "function",
-            function: {
-                name: "getAllAvailableRooms",
-                description: "Get all available rooms with real-time counts",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        checkInDate: { 
-                            type: "string", 
-                            description: "Check-in date in YYYY-MM-DD format (optional, defaults to today)" 
+                    } else if (/^\d+$/.test(content.trim())) {
+                        const num = parseInt(content.trim());
+                        if (num > 0 && num < 30) {
+                            extractedInfo.nights = num;
+                        }
+                    }
+
+                    if (content.includes('guest') || content.includes('people') || content.includes('person')) {
+                        const guestMatch = content.match(/(\d+)\s*(?:guest|guests|people|person)/i);
+                        if (guestMatch) {
+                            extractedInfo.guests = parseInt(guestMatch[1]) || 1;
                         }
                     }
                 }
             }
-        }
-    ];
+
+            const extractionPrompt = `Extract booking details from this conversation.
+
+CONVERSATION:
+${conversationText}
+
+TODAY'S DATE: ${format(new Date(), 'yyyy-MM-dd')}
+TOMORROW'S DATE: ${format(addDays(new Date(), 1), 'yyyy-MM-dd')}
+
+Extract as JSON:
+{
+  "customerName": "string (extract actual name or use 'Guest')",
+  "roomType": "string ('Single Room', 'Double Room', or 'Suite')",
+  "checkInDate": "string in YYYY-MM-DD format (use actual date, NOT 'YYYY-MM-DD')",
+  "nights": "number (1-30 only)",
+  "guests": "number (1-10 only)",
+  "specialRequests": "string"
 }
 
-    async handleFunctionCall(functionCall, phoneNumber) {
-    try {
-        console.log('🔧 Handling function call:', functionCall.name);
-        
-        let parsedArgs;
-        if (typeof functionCall.arguments === 'string') {
-            parsedArgs = JSON.parse(functionCall.arguments);
-        } else if (typeof functionCall.arguments === 'object') {
-            parsedArgs = functionCall.arguments;
-        } else {
-            parsedArgs = {};
-        }
+IMPORTANT RULES:
+1. For checkInDate: Use actual date in YYYY-MM-DD format
+   - If user says "today": Use ${format(new Date(), 'yyyy-MM-dd')}
+   - If user says "tomorrow": Use ${format(addDays(new Date(), 1), 'yyyy-MM-dd')}
+   - If no date mentioned: Use tomorrow's date
+2. NEVER use placeholder text like "YYYY-MM-DD" 
+3. Return ONLY valid JSON`;
 
-        // Safe date parsing
-        if (parsedArgs.checkInDate && typeof parsedArgs.checkInDate === 'string') {
-            parsedArgs.checkInDate = this.parseDate(parsedArgs.checkInDate);
-        } else {
-            parsedArgs.checkInDate = new Date().toISOString().split('T')[0];
-        }
+            try {
+                const completion = await this.openai.chat.completions.create({
+                    model: "gpt-4.1-mini",
+                    messages: [
+                        { role: "system", content: "Extract booking details. Return ONLY valid JSON." },
+                        { role: "user", content: extractionPrompt }
+                    ],
+                    temperature: 0.1,
+                    max_tokens: 300,
+                    response_format: { type: "json_object" }
+                });
 
-        // Set default values for optional parameters
-        if (!parsedArgs.nights || parsedArgs.nights < 1) {
-            parsedArgs.nights = 1;
-        }
-        
-        if (!parsedArgs.guests || parsedArgs.guests < 1) {
-            parsedArgs.guests = 2;
-        }
+                const extractedText = completion.choices[0].message.content;
+                console.log('AI extraction:', extractedText);
 
-        console.log('🔧 Function arguments:', JSON.stringify(parsedArgs, null, 2));
+                const aiExtracted = JSON.parse(extractedText);
 
-        switch (functionCall.name) {
-            case "checkRoomAvailability":
-                return await this.checkRoomAvailability(parsedArgs);
-            case "calculatePrice":
-                return await this.calculatePrice(parsedArgs);
-            case "createBooking":
-                // Add phone number to booking data if not provided
-                if (!parsedArgs.customerPhone) {
-                    parsedArgs.customerPhone = phoneNumber;
+                const finalDetails = {
+                    customerName: extractedInfo.customerName !== 'Guest' ? extractedInfo.customerName : (aiExtracted.customerName || 'Guest'),
+                    roomType: extractedInfo.roomType || aiExtracted.roomType || 'Single Room',
+                    checkInDate: this.parseDate(aiExtracted.checkInDate || extractedInfo.checkInDate),
+                    nights: extractedInfo.nights || (aiExtracted.nights ? parseInt(aiExtracted.nights) : 1),
+                    guests: extractedInfo.guests || (aiExtracted.guests ? parseInt(aiExtracted.guests) : 1),
+                    specialRequests: aiExtracted.specialRequests || 'None'
+                };
+
+                if (finalDetails.nights > 30 || finalDetails.nights < 1) {
+                    console.log(`⚠️ Fixing invalid nights: ${finalDetails.nights} → 1`);
+                    finalDetails.nights = 1;
                 }
-                return await this.createBooking(parsedArgs);
-            case "getHotelInfo":
-                return this.getHotelInfo();
-            case "getAllAvailableRooms":
-                return await this.getAllAvailableRooms(parsedArgs);
-            default:
-                return "I'll help you with that!";
-        }
-    } catch (error) {
-        console.error(`❌ Function ${functionCall.name} error:`, error.message, error.stack);
-        return `Sorry, I encountered an error: ${error.message}`;
-    }
-}
 
-    async checkRoomAvailability(args) {
-        const { roomType, checkInDate, nights = 1 } = args;
-        const availability = await this.bookingService.checkAvailability(roomType, checkInDate, nights);
+                const checkOutDate = addDays(new Date(finalDetails.checkInDate), finalDetails.nights);
+                finalDetails.checkOutDate = format(checkOutDate, 'yyyy-MM-dd');
 
-        if (availability.available) {
-            return `✅ ${roomType} is AVAILABLE for ${checkInDate} (${nights} night${nights > 1 ? 's' : ''})!
-💰 Price: ₹${availability.room.pricePerNight}/night
-📊 Available Rooms: ${availability.availableCount}
-📈 Total for ${nights} night${nights > 1 ? 's' : ''}: ₹${availability.room.pricePerNight * nights}
+                console.log('✅ Final booking details:', finalDetails);
+                return finalDetails;
 
-Would you like to book this room? Please provide:
-1. Your full name
-2. Number of guests
-3. Any special requests`;
-        } else {
-            return `⚠️ ${roomType} is NOT AVAILABLE for ${checkInDate}.
-📊 Available Rooms: ${availability.availableCount}
+            } catch (aiError) {
+                console.error('AI extraction failed, using manual extraction:', aiError.message);
+                if (extractedInfo.nights > 30) {
+                    extractedInfo.nights = 1;
+                }
+                const checkOutDate = addDays(new Date(extractedInfo.checkInDate), extractedInfo.nights);
+                extractedInfo.checkOutDate = format(checkOutDate, 'yyyy-MM-dd');
 
-Would you like to:
-• Check other dates?
-• See other room types?
-• Be notified when available?`;
-        }
-    }
-
-    async calculatePrice(args) {
-        const { roomType, nights, guests = 2 } = args;
-        const rooms = await this.bookingService.getAllRoomsWithAvailability();
-        const room = rooms.find(r => r.name === roomType);
-
-        if (!room) return `Sorry, I couldn't find ${roomType}. Available rooms are: ${rooms.map(r => r.name).join(', ')}`;
-
-        const total = room.pricePerNight * nights;
-        return `💰 PRICE CALCULATION:
-Room: ${roomType}
-Nightly Rate: ₹${room.pricePerNight}
-Nights: ${nights}
-Guests: ${guests}
-📊 Total: ₹${total}`;
-    }
-
-    async createBooking(args) {
-        const { customerName, customerPhone, roomType, checkInDate, nights, guests = 2, specialRequests = "None" } = args;
-
-        try {
-            const result = await this.bookingService.createBooking({
-                customerPhone, customerName, roomType, checkInDate, nights, guests, specialRequests
-            });
-
-            if (result.success) {
-                this.clearHistory(customerPhone);
-                return `🎉 BOOKING CONFIRMED! 🎉
-Thank you, ${customerName}!
-📋 Booking Details:
-• Booking ID: ${result.booking.bookingId}
-• Room: ${roomType}
-• Check-in: ${checkInDate} (${this.hotelInfo.checkInTime})
-• Nights: ${nights}
-• Guests: ${guests}
-• Total Amount: ₹${result.booking.totalAmount}
-• Status: ${result.booking.status}
-📞 Next Steps:
-1. Your booking is now in our system
-2. Room availability has been UPDATED in database
-3. We'll contact you at ${customerPhone} for payment details
-4. For any changes, quote your Booking ID: ${result.booking.bookingId}
-Special Requests: ${specialRequests}
-🏨 We look forward to hosting you at ${this.hotelInfo.name}!`;
-            } else {
-                return `❌ Booking Failed: ${result.message}
-Please try:
-• Different dates
-• Different room type
-• Or contact us directly at ${this.hotelInfo.contactPhone}`;
+                console.log('✅ Using manual extraction:', extractedInfo);
+                return extractedInfo;
             }
+
         } catch (error) {
-            console.error('Booking creation error:', error);
-            return `❌ Booking Failed: ${error.message}
-Please contact us directly at ${this.hotelInfo.contactPhone} for assistance.`;
+            console.error('❌ Error extracting booking details:', error.message);
+            return null;
         }
     }
+    shouldCreateBookingRequest(phoneNumber, userMessage) {
+        const lowerMessage = userMessage.toLowerCase();
+        const history = this.conversationHistory.get(phoneNumber) || [];
 
-    getHotelInfo() {
-        return `🏨 ${this.hotelInfo.name}
-📍 ${this.hotelInfo.location}
-📞 Contact: ${this.hotelInfo.contactPhone}
-📧 Email: ${this.hotelInfo.contactEmail}
-⏰ Check-in: ${this.hotelInfo.checkInTime}
-⏰ Check-out: ${this.hotelInfo.checkOutTime}
-🌟 Amenities:
-${this.hotelInfo.amenities.map(a => `• ${a}`).join('\n')}
-💬 How can I assist you today?
-• Check room availability & prices
-• Make a booking
-• Special requests
-• Local attractions
-• Any other questions?`;
+        console.log('Checking booking trigger for:', lowerMessage);
+
+        // Check for explicit confirmation
+        const confirmationKeywords = ['yes', 'confirm', 'proceed', 'go ahead'];
+        const isConfirming = confirmationKeywords.some(keyword =>
+            lowerMessage.includes(keyword) && !lowerMessage.includes('not')
+        );
+
+        const conversationText = history.map(msg => msg.content).join(' ').toLowerCase();
+
+        const hasRoomType = conversationText.includes('single') ||
+            conversationText.includes('double') ||
+            conversationText.includes('suite');
+
+        const hasCheckInDate = conversationText.includes('tomorrow') ||
+            conversationText.includes('today') ||
+            conversationText.includes('check-in') ||
+            /\d{4}-\d{2}-\d{2}/.test(conversationText);
+
+        const hasNights = /\d+\s*(?:night|nights|stay)/i.test(conversationText) ||
+            (/\d+/.test(conversationText) && conversationText.includes('night'));
+
+        const hasGuests = /\d+\s*(?:guest|guests|people|person)/i.test(conversationText) ||
+            (/\d+/.test(conversationText) && conversationText.includes('guest'));
+
+        const hasName = /name is|i am |call me /i.test(conversationText) ||
+            (history.some(msg =>
+                msg.role === 'user' &&
+                msg.content.length > 1 &&
+                msg.content.length < 30 &&
+                !msg.content.includes(' ') &&
+                !msg.content.match(/^\d+$/) &&
+                !['no', 'not', 'cancel'].some(word => msg.content.toLowerCase().includes(word))
+            ));
+
+        const hasAllInfo = hasRoomType && hasCheckInDate && hasNights && hasGuests && hasName;
+
+        const lastAIMessage = history.filter(msg => msg.role === 'assistant').pop()?.content || '';
+        const aiAskedForConfirmation = lastAIMessage.includes('confirm') ||
+            lastAIMessage.includes('type confirm') ||
+            lastAIMessage.includes('please confirm');
+
+        const shouldCreate = isConfirming && aiAskedForConfirmation && hasAllInfo;
+
+        return shouldCreate;
     }
 
-    async getAllAvailableRooms(args) {
-    try {
-        const checkInDate = args?.checkInDate || '';
-        const parsedDate = this.parseDate(checkInDate);
-        
-        // Validate parsed date
-        if (!parsedDate || isNaN(new Date(parsedDate).getTime())) {
-            throw new Error('Invalid date format');
-        }
-        
-        const rooms = await this.bookingService.getAllRoomsWithAvailability(parsedDate);
+    /** Get fallback response */
+    async getFallbackResponse(userMessage) {
+        const lowerMessage = userMessage.toLowerCase();
+        const rooms = await this.bookingService.getAllRoomsWithAvailability();
 
-        if (rooms.length === 0) {
-            return "No rooms available for the selected dates. Please try different dates.";
-        }
-
-        const availableRooms = rooms.filter(room => room.isAvailable);
-        
-        if (availableRooms.length === 0) {
-            return `All rooms are booked for ${parsedDate}. Please try different dates.`;
-        }
-
-        const roomsList = availableRooms.map(room => 
-            `• ${room.name}: ₹${room.pricePerNight}/night (${room.availableCount} available)`
+        const roomOptions = rooms.map(room =>
+            `• ${room.name}: Nu.${room.pricePerNight}/night (${room.availableCount} available)`
         ).join('\n');
-        
-        return `🏨 AVAILABLE ROOMS for ${parsedDate}:
-${roomsList}
-💡 All prices are per night. Availability updates in real-time when bookings are made.`;
-    } catch (error) {
-        console.error('Error in getAllAvailableRooms:', error.message);
-        return "I'm having trouble checking room availability. Please contact us directly or try again.";
+
+        if (lowerMessage.includes('hello') || lowerMessage.includes('hi') || lowerMessage.includes('hey')) {
+            return `Hello! 👋 Welcome to ${this.hotelInfo.name}! 
+
+    I'm your AI booking assistant. Here's what I can help you with:
+    🏨 Book a room
+    📅 Check availability  
+    💰 Get price quotes
+    ❓ Answer questions
+
+    Available rooms right now:
+    ${roomOptions}
+
+    How can I assist you today?`;
+        }
+
+        if (lowerMessage.includes('book') || lowerMessage.includes('room') || lowerMessage.includes('stay')) {
+            return `Great! I'll help you book a room. 😊
+
+    Available rooms:
+    ${roomOptions}
+
+    To book, I need a few details:
+    1. 🏨 Which room type would you like?
+    2. 📅 What is your check-in date?
+    3. 🌙 How many nights will you stay?
+    4. 👥 How many guests?
+
+    Would you like to start with room selection?`;
+        }
+
+        if (lowerMessage.includes('price') || lowerMessage.includes('cost') || lowerMessage.includes('how much')) {
+            return `💰 Our Room Prices:
+    ${roomOptions}
+
+    *Note:* All prices are per night. Would you like to book one of these rooms?`;
+        }
+
+        if (lowerMessage.includes('available') || lowerMessage.includes('vacant')) {
+            return `✅ Current Room Availability:
+    ${roomOptions}
+
+    Which room would you like to book?`;
+        }
+
+        if (lowerMessage.includes('amenities') || lowerMessage.includes('facilities')) {
+            return `⭐ Hotel Amenities:
+    ${this.hotelInfo.amenities.map(amenity => `• ${amenity}`).join('\n')}
+
+    ⏰ Check-in: ${this.hotelInfo.checkInTime}
+    ⏰ Check-out: ${this.hotelInfo.checkOutTime}
+    📍 Location: ${this.hotelInfo.location}
+
+    Would you like to know more or book a room?`;
+        }
+
+        return `I'm here to help you with your hotel booking at ${this.hotelInfo.name}! 🏨
+
+    You can ask me about:
+    • Room availability and prices
+    • Booking process
+    • Hotel amenities
+    • Check-in/check-out times
+
+    Or just say "I want to book a room" to get started! 😊
+
+    Available rooms:
+    ${roomOptions}`;
     }
-}
+
+    clearHistory(phoneNumber) {
+        if (this.conversationHistory.has(phoneNumber)) {
+            this.conversationHistory.set(phoneNumber, []);
+        }
+        if (this.bookingIntents.has(phoneNumber)) {
+            this.bookingIntents.delete(phoneNumber);
+        }
+    }
+
+    userProvidedInfo(conversation, infoType) {
+        const lowerConv = conversation.toLowerCase();
+        switch (infoType) {
+            case 'checkInDate':
+                return lowerConv.includes('tomorrow') || lowerConv.includes('today') || /\d{1,2}/.test(lowerConv);
+            case 'nights':
+                return lowerConv.includes('night') || /\d+\s*(?:night|nights)/.test(lowerConv);
+            case 'guests':
+                return lowerConv.includes('guest') || lowerConv.includes('people');
+            case 'name':
+                return lowerConv.includes('name') || lowerConv.includes('i am ') || lowerConv.includes('call me');
+            default:
+                return false;
+        }
+    }
 }
 
 module.exports = OpenAIService;
