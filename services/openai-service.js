@@ -2,7 +2,6 @@ const OpenAI = require('openai');
 require('dotenv').config();
 const { parse, format, isValid, addDays } = require('date-fns');
 
-
 class OpenAIService {
     constructor(bookingService) {
         if (!process.env.OPENAI_API_KEY) {

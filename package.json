@@ -4,22 +4,21 @@
   "description": "WhatsApp Hotel Booking Bot with Google Sheets",
   "main": "index.js",
   "scripts": {
-    "start": "node start-all.js",
-    "bot": "node index.js",
+    "start": "node whatsapp-api-server.js",
     "dashboard": "node employee-dashboard.js",
-    "start:all": "concurrently \"npm run start\" \"npm run dashboard\"",
-    "dev": "nodemon index.js"
+    "dev": "concurrently \"npm run start\" \"npm run dashboard\""
   },
   "dependencies": {
     "axios": "^1.13.2",
+    "body-parser": "^2.2.1",
     "cors": "^2.8.5",
     "date-fns": "^2.30.0",
     "dotenv": "^16.3.1",
-    "express": "^4.18.2",
+    "express": "^4.22.1",
     "googleapis": "^128.0.0",
+    "ngrok": "^5.0.0-beta.2",
     "openai": "^4.28.0",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.23.0"
+    "whatsapp": "^0.0.5-Alpha"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
