@@ -1,13 +1,12 @@
-const { max } = require('date-fns');
-const { de } = require('date-fns/locale');
+// services/google-sheets-service.js - UPDATED
 const { google } = require('googleapis');
 const path = require('path');
+const SheetColumnMapper = require('../utils/sheet-column-mapper');
+const sheetConfig = require('../config/sheets-config');
 
 class GoogleSheetsService {
     constructor() {
-
         console.log('📊 Initializing GoogleSheetsService...');
-        console.log('GOOGLE_SHEETS_ID from env:', process.env.GOOGLE_SHEETS_ID);
 
         this.auth = new google.auth.GoogleAuth({
             keyFile: path.join(__dirname, '../credentials.json'),
@@ -16,480 +15,369 @@ class GoogleSheetsService {
 
         this.sheets = google.sheets({ version: 'v4' });
         this.spreadsheetId = process.env.GOOGLE_SHEETS_ID;
+
+        // Initialize column mapper
+        this.mapper = new SheetColumnMapper(this.sheets, this.auth, this.spreadsheetId);
+
+        // Column maps will be populated on first use
+        this.roomsColumnMap = null;
+        this.bookingsColumnMap = null;
+    }
+
+    async ensureColumnMaps() {
+        if (!this.roomsColumnMap) {
+            this.roomsColumnMap = await this.mapper.getColumnMap(
+                sheetConfig.ROOMS_SHEET.sheetName,
+                sheetConfig.ROOMS_SHEET.columns
+            );
+        }
+        if (!this.bookingsColumnMap) {
+            this.bookingsColumnMap = await this.mapper.getColumnMap(
+                sheetConfig.BOOKINGS_SHEET.sheetName,
+                sheetConfig.BOOKINGS_SHEET.columns
+            );
+        }
     }
 
     async getAllRooms() {
+        await this.ensureColumnMaps();
+
         try {
             const res = await this.sheets.spreadsheets.values.get({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'rooms_tab!A2:I'
+                range: `${sheetConfig.ROOMS_SHEET.sheetName}!A:I`
             });
 
-            console.log('📊 Raw rooms data:', res.data.values);
+            const rows = res.data.values || [];
+            const headers = rows[0] || [];
+            const dataRows = rows.slice(1);
 
-            return (res.data.values || []).map((row, i) => {
-                // Handle empty rows
-                if (!row || row.length === 0) return null;
+            console.log(`📊 Found ${dataRows.length} room rows`);
 
-                // Parse booked dates
-                let bookedDates = [];
-                if (row[5] && row[5].trim() !== '') {
-                    bookedDates = row[5].split(',').map(d => d.trim()).filter(d => {
-                        if (!d) return false;
-                        const date = new Date(d);
-                        return date.toString() !== 'Invalid Date';
-                    });
-                }
+            return dataRows.map((row, i) => {
+                const map = this.roomsColumnMap;
 
-                const roomData = {
-                    roomId: row[0] || `R${i + 100}`,
-                    name: row[1] || `Room ${i + 1}`,
-                    pricePerNight: parseInt(row[2]) || 0,
-                    totalRooms: parseInt(row[3]) || 0,
-                    availableCount: parseInt(row[4]) || 0,
-                    bookedDates: bookedDates,
-                    maxGuest: parseInt(row[6]) || 1,
-                    amenities: row[7] ? row[7].split(',').map(a => a.trim()) : [],
-                    description: row[8] || ''
+                const get = (key, defaultValue = '') => {
+                    const index = map[key];
+                    return index !== undefined && row[index] !== undefined
+                        ? row[index]
+                        : defaultValue;
                 };
 
-                console.log(`Room ${i + 1}:`, roomData.name, 'Available:', roomData.availableCount);
-                return roomData;
+                let bookedDates = [];
+                const bookedDatesStr = get('BOOKED_DATES');
+                if (bookedDatesStr && bookedDatesStr.trim() !== '') {
+                    bookedDates = bookedDatesStr.split(',')
+                        .map(d => d.trim())
+                        .filter(d => d && !d.includes('#ERROR!'));
+                }
+
+                // Get max guest capacity
+                let maxGuest = 1;
+                const maxGuestStr = get('MAX_GUEST');
+                if (maxGuestStr) {
+                    maxGuest = parseInt(maxGuestStr) || 1;
+                } else {
+                    // Fallback based on room name
+                    const roomName = get('ROOM_NAME', '').toLowerCase();
+                    if (roomName.includes('single')) maxGuest = 1;
+                    else if (roomName.includes('double')) maxGuest = 2;
+                    else if (roomName.includes('triple')) maxGuest = 3;
+                    else if (roomName.includes('quad')) maxGuest = 4;
+                    else if (roomName.includes('family') || roomName.includes('suite')) maxGuest = 5;
+                }
+
+                return {
+                    roomId: get('ROOM_ID', `R${i + 100}`),
+                    name: get('ROOM_NAME', `Room ${i + 1}`),
+                    pricePerNight: parseInt(get('PRICE')) || 0,
+                    totalRooms: parseInt(get('TOTAL_ROOMS')) || 0,
+                    availableCount: parseInt(get('CURRENT_AVAILABLE')) || 0,
+                    bookedDates: bookedDates,
+                    maxGuest: maxGuest,
+                    amenities: get('AMENITIES') ?
+                        get('AMENITIES').split(',').map(a => a.trim()) : [],
+                    description: get('DESCRIPTION', '')
+                };
             }).filter(room => room !== null);
+
         } catch (error) {
             console.error('❌ Error getting rooms:', error);
             return [];
         }
     }
 
-    getDateRange(startDate, nights) {
-        const dates = [];
-        const start = new Date(startDate);
-
-        for (let i = 0; i < nights; i++) {
-            const d = new Date(start);
-            d.setDate(start.getDate() + i);
-            dates.push(d.toISOString().split('T')[0]);
-        }
-        return dates;
-    }
-
-    parseNights(value) {
-        if (!value) return 1;
-
-        if (typeof value === 'string' && value.startsWith('1900')) {
-            const day = parseInt(value.split('-')[2]);
-            return Math.max(1, day - 1);
-        }
-
-        const n = parseInt(value);
-        return isNaN(n) || n < 1 ? 1 : n;
-    }
-
-    async checkAvailability(roomType, checkInDate, nights = 1) {
-        try {
-            console.log(`🔍 Checking availability for: ${roomType}, ${checkInDate}, ${nights} nights`);
-
-            const rooms = await this.getAllRooms();
-            console.log(`Found ${rooms.length} rooms`);
-
-            // Normalize room type search
-            const searchTerm = roomType.toLowerCase().trim();
-            const room = rooms.find(r => {
-                const roomName = r.name.toLowerCase().trim();
-                return roomName.includes(searchTerm) || searchTerm.includes(roomName);
-            });
-
-            console.log('Found room:', room ? room.name : 'None');
-
-            if (!room) {
-                return {
-                    available: false,
-                    message: `Room type "${roomType}" not found. Available: ${rooms.map(r => r.name).join(', ')}`,
-                    availableCount: 0
-                };
-            }
-
-            const isAvailable = room.availableCount > 0;
-            const result = {
-                available: isAvailable,
-                availableCount: room.availableCount,
-                room: room,
-                message: isAvailable
-                    ? `✅ ${room.name} is available! ${room.availableCount} room(s) free.`
-                    : `❌ ${room.name} is not available. Only ${room.availableCount} room(s) left.`
-            };
-
-            console.log(`✅ Availability result:`, result);
-            return result;
-
-        } catch (error) {
-            console.error('❌ Error checking availability:', error);
-            return {
-                available: false,
-                message: `Error checking availability: ${error.message}`,
-                availableCount: 0
-            };
-        }
-    }
     async createBookingRequest(bookingData) {
+        await this.ensureColumnMaps();
+
         try {
             const bookingId = `BK${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
-            const {
-                customerName,
-                customerPhone,
-                roomType,
-                checkInDate,
-                nights = 1,
-                guests = 2,
-                specialRequests = "None",
-                status = 'requested' // Default to requested, not confirmed
-            } = bookingData;
+            const map = this.bookingsColumnMap;
 
-            console.log(`📝 Creating booking REQUEST (status: ${status}):`, { customerName, roomType, checkInDate, nights });
+            // Get header row to know how many columns to fill
+            const headerRes = await this.sheets.spreadsheets.values.get({
+                auth: this.auth,
+                spreadsheetId: this.spreadsheetId,
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!1:1`
+            });
 
-            // Check availability
-            const availability = await this.checkAvailability(roomType, checkInDate, nights);
-            if (!availability.available) {
-                throw new Error(`Room not available: ${availability.message}`);
+            const totalColumns = headerRes.data.values[0].length;
+            const bookingRow = new Array(totalColumns).fill('');
+
+            // Map data to correct columns
+            if (map.BOOKING_ID !== undefined) bookingRow[map.BOOKING_ID] = bookingId;
+            if (map.CUSTOMER_NAME !== undefined) bookingRow[map.CUSTOMER_NAME] = bookingData.customerName;
+            if (map.PHONE !== undefined) bookingRow[map.PHONE] = bookingData.customerPhone;
+            if (map.ROOM_TYPE !== undefined) bookingRow[map.ROOM_TYPE] = bookingData.roomType;
+            if (map.ROOM_COUNT !== undefined) bookingRow[map.ROOM_COUNT] = bookingData.roomCount || 1;
+            if (map.TOTAL_ROOMS !== undefined) bookingRow[map.TOTAL_ROOMS] = bookingData.totalRooms || (bookingData.roomCount || 1);
+            if (map.CHECK_IN !== undefined) bookingRow[map.CHECK_IN] = bookingData.checkInDate;
+            if (map.CHECK_OUT !== undefined) bookingRow[map.CHECK_OUT] = bookingData.checkOutDate;
+            if (map.NIGHTS !== undefined) bookingRow[map.NIGHTS] = bookingData.nights.toString();
+            if (map.GUESTS !== undefined) bookingRow[map.GUESTS] = bookingData.guests.toString();
+
+            // Calculate total amount based on room price
+            let totalAmount = 0;
+            if (bookingData.totalAmount) {
+                totalAmount = bookingData.totalAmount;
+            } else {
+                // Try to calculate based on room type
+                const rooms = await this.getAllRooms();
+                const room = rooms.find(r => r.name === bookingData.roomType);
+                if (room) {
+                    totalAmount = room.pricePerNight * (bookingData.nights || 1) * (bookingData.roomCount || 1);
+                }
             }
 
-            // Calculate details
-            const totalAmount = availability.room.pricePerNight * nights;
-            const checkOutDate = this.calculateCheckOutDate(checkInDate, nights);
-            const roomId = availability.room.roomId;
-            const currentTime = new Date().toISOString();
+            if (map.TOTAL !== undefined) bookingRow[map.TOTAL] = totalAmount.toString();
+            if (map.STATUS !== undefined) bookingRow[map.STATUS] = 'requested';
+            if (map.PAYMENT_STATUS !== undefined) bookingRow[map.PAYMENT_STATUS] = 'pending';
+            if (map.SPECIAL_REQUESTS !== undefined) bookingRow[map.SPECIAL_REQUESTS] = bookingData.specialRequests || 'None';
+            if (map.REQUESTED_AT !== undefined) bookingRow[map.REQUESTED_AT] = new Date().toISOString();
 
-            console.log(`💰 Total: ${totalAmount}, Check-out: ${checkOutDate}, Room ID: ${roomId}`);
-
-            // Insert into bookings_tab - MAKE SURE status is 'requested'
-            const bookingRow = [
-                bookingId,                    // A: BookingID
-                customerName,                 // B: Customer Name
-                customerPhone,                // C: Phone
-                roomType,                     // D: Room Type
-                roomId,                       // E: Room ID
-                checkInDate,                  // F: Check-in
-                checkOutDate,                 // G: Check-out
-                nights.toString(),           // H: Nights
-                guests.toString(),           // I: Guests
-                totalAmount.toString(),      // J: Total
-                'requested',                 // K: Status - MUST BE 'requested'
-                'pending',                   // L: Payment Status
-                '',                          // M: Payment Method
-                specialRequests,             // N: Special Reqests
-                currentTime,                 // O: RequestedAt
-                '',                          // P: ConfirmedAt (empty for requests)
-                '',                          // Q: Confirmed By (empty for requests)
-                '',                          // R: Check-in At
-                '',                          // S: Check-out At
-                ''                           // T: Notes
-            ];
-
-            console.log('📝 Booking row to insert:', bookingRow);
+            console.log('📝 Booking row (with room count):', bookingRow);
 
             await this.sheets.spreadsheets.values.append({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'bookings_tab!A:T',
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!A:Z`,
                 valueInputOption: 'USER_ENTERED',
                 insertDataOption: 'INSERT_ROWS',
-                resource: {
-                    values: [bookingRow]
-                }
+                resource: { values: [bookingRow] }
             });
 
-            console.log(`✅ Booking REQUEST ${bookingId} inserted into Google Sheets (status: requested)`);
-
-            // IMPORTANT: DO NOT update room availability yet - wait for staff approval
-            // Room availability should only be decreased when booking is CONFIRMED by staff
+            console.log(`✅ Booking request ${bookingId} inserted with room count`);
 
             return {
                 success: true,
                 booking: {
                     bookingId,
-                    customerName,
-                    customerPhone,
-                    roomType,
-                    roomId,
-                    checkInDate,
-                    checkOutDate,
-                    nights,
-                    guests,
-                    totalAmount,
-                    status: 'requested' // Important: return as requested
-                },
-                message: 'Booking request submitted successfully! Our staff will contact you shortly to confirm.'
+                    customerName: bookingData.customerName,
+                    customerPhone: bookingData.customerPhone,
+                    roomType: bookingData.roomType,
+                    roomCount: bookingData.roomCount || 1,
+                    totalRooms: bookingData.totalRooms || (bookingData.roomCount || 1),
+                    checkInDate: bookingData.checkInDate,
+                    checkOutDate: bookingData.checkOutDate,
+                    nights: bookingData.nights,
+                    guests: bookingData.guests,
+                    totalAmount: totalAmount,
+                    status: 'requested'
+                }
             };
 
         } catch (error) {
-            console.error('❌ Booking request error:', error);
+            console.error('❌ Dynamic booking creation error:', error);
             throw error;
         }
     }
 
-    async cancelBooking(bookingId, reason = 'Cancelled by staff') {
-        try {
-            console.log(`❌ Cancelling booking ${bookingId}: ${reason}`);
+    async getAllBookings(filters = {}) {
+        await this.ensureColumnMaps();
 
-            // Get all bookings to find the specific one
+        try {
+            // Get all data (with wide range)
             const response = await this.sheets.spreadsheets.values.get({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'bookings_tab!A2:T' // Get all columns
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!A:Z`
             });
 
             const rows = response.data.values || [];
-            console.log(`📊 Found ${rows.length} bookings in sheet`);
+            const headers = rows[0] || [];
+            const dataRows = rows.slice(1);
 
-            // Find the booking row
-            const rowIndex = rows.findIndex(row => row[0] === bookingId);
+            console.log(`📋 Found ${dataRows.length} booking rows with ${headers.length} columns`);
 
-            if (rowIndex === -1) {
-                throw new Error(`Booking ${bookingId} not found in Google Sheets`);
+            const map = this.bookingsColumnMap;
+
+            const bookings = dataRows.map(row => {
+                // Helper function with dynamic mapping
+                const get = (key, defaultValue = '') => {
+                    const index = map[key];
+                    return index !== undefined && row[index] !== undefined
+                        ? row[index]
+                        : defaultValue;
+                };
+
+                return {
+                    bookingId: get('BOOKING_ID'),
+                    customerName: get('CUSTOMER_NAME'),
+                    customerPhone: get('PHONE'),
+                    roomType: get('ROOM_TYPE'),
+                    roomId: get('ROOM_ID'),
+                    checkInDate: get('CHECK_IN'),
+                    checkOutDate: get('CHECK_OUT'),
+                    nights: this.parseNights(get('NIGHTS')),
+                    guests: parseInt(get('GUESTS')) || 1,
+                    totalAmount: parseInt(get('TOTAL')) || 0,
+                    status: (get('STATUS') || '').toLowerCase(),
+                    paymentStatus: get('PAYMENT_STATUS') || 'pending',
+                    paymentMethod: get('PAYMENT_METHOD') || '',
+                    specialRequests: get('SPECIAL_REQUESTS') || '',
+                    requestedAt: get('REQUESTED_AT') || '',
+                    confirmedAt: get('CONFIRMED_AT') || '',
+                    confirmedBy: get('CONFIRMED_BY') || '',
+                    checkInAt: get('CHECK_IN_AT') || '',
+                    checkOutAt: get('CHECK_OUT_AT') || '',
+                    notes: get('NOTES') || '',
+
+                    // Store raw row for debugging
+                    _rawRow: row,
+                    _columnMap: map
+                };
+            });
+
+            // Apply filters dynamically
+            let filtered = bookings;
+
+            if (filters.status) {
+                filtered = filtered.filter(b =>
+                    b.status.toLowerCase() === filters.status.toLowerCase()
+                );
             }
 
-            console.log(`✅ Found booking at row ${rowIndex + 2}`);
-
-            // IMPORTANT: Google Sheets rows start at 1, and we have header row at row 1
-            const sheetRow = rowIndex + 2; // +1 for zero-index, +1 for header row
-
-            const bookingRow = rows[rowIndex];
-            console.log(`📝 Booking row data:`, bookingRow);
-
-            // Check current status before cancelling
-            const currentStatus = bookingRow[10] || ''; // Column K = Status
-            console.log(`📊 Current status: ${currentStatus}`);
-
-            // Update status to 'cancelled' (Column K = status column, index 10)
-            await this.sheets.spreadsheets.values.update({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!K${sheetRow}`,
-                valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [['cancelled']]
-                }
-            });
-
-            console.log(`✅ Updated status to 'cancelled'`);
-
-            // Update notes column (Column T = Notes column, index 19)
-            await this.sheets.spreadsheets.values.update({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!T${sheetRow}`,
-                valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [[`Cancelled: ${reason} (${new Date().toLocaleString()})`]]
-                }
-            });
-
-            console.log(`✅ Added cancellation note`);
-
-            // If booking was confirmed, restore room availability
-            if (currentStatus.toLowerCase() === 'confirmed') {
-                console.log(`🔄 Booking was confirmed, restoring room availability...`);
-
-                // Get booking details for room restoration
-                const roomType = bookingRow[3]; // Column D = Room Type
-                const checkInDate = bookingRow[5]; // Column F = Check-in date
-                const nights = parseInt(bookingRow[7]) || 1; // Column H = Nights
-
-                console.log(`📊 Restoration details:`, { roomType, checkInDate, nights });
-
-                if (roomType && checkInDate) {
-                    try {
-                        // Increment room availability (this will remove booked dates)
-                        await this.incrementRoomAvailability(bookingRow[4] || roomType, checkInDate, nights);
-                        console.log(`✅ Room availability restored for ${roomType}`);
-                    } catch (roomError) {
-                        console.error(`❌ Error restoring room availability:`, roomError);
-                    }
-                }
+            if (filters.date) {
+                filtered = filtered.filter(b =>
+                    b.checkInDate === filters.date || b.checkOutDate === filters.date
+                );
             }
 
-            // Log activity
-            await this.logActivity({
-                date: new Date().toISOString().split('T')[0],
-                bookingId,
-                action: 'cancelled',
-                performedBy: 'Staff',
-                details: `Booking cancelled: ${reason}.`
-            });
+            if (filters.roomType) {
+                filtered = filtered.filter(b =>
+                    b.roomType.toLowerCase().includes(filters.roomType.toLowerCase())
+                );
+            }
 
-            console.log(`✅ Booking ${bookingId} cancelled successfully in Google Sheets`);
-            return {
-                success: true,
-                message: 'Booking cancelled successfully',
-                bookingId: bookingId
-            };
+            if (!filters.includeCancelled) {
+                filtered = filtered.filter(b => b.status !== 'cancelled');
+            }
+
+            return filtered;
 
         } catch (error) {
-            console.error('❌ Error cancelling booking in Google Sheets:', error);
-            throw error;
-        }
-    }
-
-    async getAllRoomsWithAvailability(checkInDate = null, nights = 1) {
-        try {
-            const rooms = await this.getAllRooms();
-            console.log(`📊 Got ${rooms.length} rooms from Google Sheets`);
-
-            // If checkInDate provided, check availability for specific dates
-            if (checkInDate) {
-                console.log(`🔍 Checking availability for ${checkInDate}, ${nights} nights`);
-                return await Promise.all(rooms.map(async (room) => {
-                    try {
-                        const availability = await this.checkAvailability(room.name, checkInDate, nights);
-                        return {
-                            ...room,
-                            isAvailable: availability.available,
-                            availableCount: availability.availableCount,
-                            availabilityMessage: availability.message
-                        };
-                    } catch (error) {
-                        console.error(`Error checking availability for ${room.name}:`, error);
-                        return {
-                            ...room,
-                            isAvailable: false,
-                            availableCount: 0,
-                            availabilityMessage: `Error checking availability`
-                        };
-                    }
-                }));
-            }
-
-            // Just return current availability
-            const roomsWithAvailability = rooms.map(room => ({
-                ...room,
-                isAvailable: room.availableCount > 0,
-                availabilityMessage: room.availableCount > 0
-                    ? `✅ ${room.availableCount} available`
-                    : `❌ Booked`
-            }));
-
-            console.log(`📊 Rooms with availability:`, roomsWithAvailability.map(r =>
-                `${r.name}: ${r.isAvailable ? 'Available' : 'Booked'} (${r.availableCount})`
-            ));
-
-            return roomsWithAvailability;
-        } catch (error) {
-            console.error('❌ Error getting rooms with availability:', error);
+            console.error('❌ Dynamic booking fetch error:', error);
             return [];
         }
     }
 
-    async getPendingBookings() {
-        try {
-            const response = await this.sheets.spreadsheets.values.get({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: 'bookings_tab!A2:T' // All columns
-            });
-
-            const rows = response.data.values || [];
-
-            return rows
-                .filter(row => {
-                    const status = row[10]; // Column K = status
-                    return status === 'requested' || status === 'Requested';
-                })
-                .map(row => ({
-                    bookingId: row[0],
-                    customerName: row[1],
-                    customerPhone: row[2],
-                    roomType: row[3],
-                    roomId: row[4],
-                    checkInDate: row[5],
-                    checkOutDate: row[6],
-                    nights: parseInt(row[7]) || 1,
-                    guests: parseInt(row[8]) || 2,
-                    totalAmount: parseInt(row[9]) || 0,
-                    status: row[10],
-                    paymentStatus: row[11] || 'pending',
-                    paymentMethod: row[12] || "online",
-                    specialRequests: row[13] || 'No Special Requests',
-                }));
-        } catch (error) {
-            console.error('Error getting pending bookings:', error);
-            return [];
-        }
-    }
+    // Updated approveBooking with dynamic columns
+    // Add these methods to GoogleSheetsService class:
 
     async approveBooking(bookingId, employeeName = 'Staff') {
+        await this.ensureColumnMaps();
+
         try {
+            // Find booking
+            const bookings = await this.getAllBookings({ includeCancelled: true });
+            const booking = bookings.find(b => b.bookingId === bookingId);
+
+            if (!booking) throw new Error('Booking not found');
+            if (booking.status !== 'requested') {
+                throw new Error(`Booking is ${booking.status}, cannot approve`);
+            }
+
+            // Get the actual row in sheet
             const response = await this.sheets.spreadsheets.values.get({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'bookings_tab!A2:T'
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!A:Z`
             });
 
             const rows = response.data.values || [];
-            const rowIndex = rows.findIndex(row => row[0] === bookingId);
+            const rowIndex = rows.findIndex(row =>
+                row[this.bookingsColumnMap.BOOKING_ID] === bookingId
+            );
 
-            if (rowIndex === -1) {
-                throw new Error('Booking not found');
-            }
+            if (rowIndex === -1) throw new Error('Booking not found in sheet');
 
-            const booking = rows[rowIndex];
-            const currentRow = rowIndex + 2;
+            const sheetRow = rowIndex + 1; // +1 because sheet rows start at 1
+            const map = this.bookingsColumnMap;
             const currentTime = new Date().toISOString();
 
-            // Update status to confirmed
+            // 1. Update status to 'confirmed'
             await this.sheets.spreadsheets.values.update({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!K${currentRow}`, // Status column
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.STATUS)}${sheetRow}`,
                 valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [['confirmed']]
-                }
+                resource: { values: [['confirmed']] }
             });
 
-            // Update confirmation details
-            await this.sheets.spreadsheets.values.update({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!P${currentRow}:Q${currentRow}`, // ConfirmedAt and Confirmed By
-                valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [[currentTime, employeeName]]
-                }
-            });
+            // 2. Update payment status to 'paid'
+            if (map.PAYMENT_STATUS !== undefined) {
+                await this.sheets.spreadsheets.values.update({
+                    auth: this.auth,
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.PAYMENT_STATUS)}${sheetRow}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [['paid']] }
+                });
+            }
 
-            // Update payment status
-            await this.sheets.spreadsheets.values.update({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!L${currentRow}`, // Payment Status column
-                valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [['paid']]
-                }
-            });
+            // 3. Add confirmation timestamp
+            if (map.CONFIRMED_AT !== undefined) {
+                await this.sheets.spreadsheets.values.update({
+                    auth: this.auth,
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.CONFIRMED_AT)}${sheetRow}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[currentTime]] }
+                });
+            }
 
-            // NOW decrease room availability
-            const roomType = booking[3]; // D: Room Type
-            const checkInDate = booking[5]; // F: Check-in
-            const nights = parseInt(booking[7]) || 1; // H: Nights
-            const totalAmount = parseInt(booking[9]) || 0;
+            // 4. Add confirmed by
+            if (map.CONFIRMED_BY !== undefined) {
+                await this.sheets.spreadsheets.values.update({
+                    auth: this.auth,
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.CONFIRMED_BY)}${sheetRow}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[employeeName]] }
+                });
+            }
 
-            console.log(`📊 Confirming booking ${bookingId} - decreasing availability for ${roomType}`);
-            await this.updateRoomBookedDates(roomType, checkInDate, nights, bookingId, true);
+            // 5. MOST IMPORTANT: DECREASE ROOM AVAILABILITY
+            console.log(`📊 Decreasing room availability for ${booking.roomType}...`);
+            await this.updateRoomAvailability(booking.roomType, booking.checkInDate, booking.nights, true);
 
-            // Log activity
+            // 6. Log activity
             await this.logActivity({
                 date: new Date().toISOString().split('T')[0],
-                bookingId,
+                bookingId: bookingId,
                 action: 'approved',
                 performedBy: employeeName,
-                details: `Booking approved by ${employeeName} and payment received: Nu.${totalAmount}`
+                details: `Booking approved by ${employeeName}. Total: Nu.${booking.totalAmount}`
             });
 
-            console.log(`✅ Booking ${bookingId} approved by ${employeeName}`);
+            // 7. Send WhatsApp confirmation (optional)
+            const confirmationMessage = `🎉 *BOOKING CONFIRMED!*\n\nYour booking ${bookingId} has been confirmed!\n\n📋 Details:\n• Room: ${booking.roomType}\n• Check-in: ${booking.checkInDate}\n• Check-out: ${booking.checkOutDate}\n• Total: Nu.${booking.totalAmount}\n\n🏨 We look forward to hosting you at our hotel!`;
 
+            // Uncomment if you want to send WhatsApp confirmation
+            // await this.sendWhatsAppConfirmation(booking.customerPhone, confirmationMessage);
+
+            console.log(`✅ Booking ${bookingId} approved by ${employeeName}`);
             return {
                 success: true,
                 message: `Booking ${bookingId} confirmed successfully!`
@@ -501,285 +389,296 @@ class GoogleSheetsService {
         }
     }
 
-    // Helper methods
-    getDateRange(startDate, nights) {
-        const dates = [];
-        const start = new Date(startDate);
-
-        for (let i = 0; i < nights; i++) {
-            const date = new Date(start);
-            date.setDate(start.getDate() + i);
-            dates.push(date.toISOString().split('T')[0]);
+    // Add this helper method to get column letter
+    getColumnLetter(index) {
+        let letter = '';
+        while (index >= 0) {
+            letter = String.fromCharCode(65 + (index % 26)) + letter;
+            index = Math.floor(index / 26) - 1;
         }
-
-        return dates;
+        return letter;
     }
 
-    calculateCheckOutDate(checkInDate, nights) {
-        const date = new Date(checkInDate);
-        date.setDate(date.getDate() + nights);
-        return date.toISOString().split('T')[0];
-    }
-
-    async updateCustomerRecord(phone, name, amount = 0) {
+    // Update room availability (increase or decrease)
+    async updateRoomAvailability(roomType, checkInDate, nights, shouldDecrease = true) {
         try {
-            // Implementation for customers sheet
-            // Similar to previous but for Google Sheets
-        } catch (error) {
-            console.error('Error updating customer record:', error);
-        }
-    }
+            console.log(`🔄 ${shouldDecrease ? 'Decreasing' : 'Increasing'} availability for ${roomType}...`);
 
-    async markRoomPending(roomType, checkInDate, nights, bookingId) {
-        // Optional: Mark room as temporarily pending
-        // This prevents double booking between request and confirmation
-    }
-
-    async updateRoomBookedDates(roomType, checkInDate, nights, bookingId, shouldBook = true) {
-        try {
-            // Get current room data
             const rooms = await this.getAllRooms();
-            const room = rooms.find(r => r.name && r.name.toLowerCase() === roomType.toLowerCase());
+            const room = rooms.find(r => r.name.toLowerCase() === roomType.toLowerCase());
 
             if (!room) {
                 console.warn(`❌ Room ${roomType} not found`);
                 return;
             }
 
-            // Calculate dates to book/unbook
-            const datesToUpdate = this.getDateRange(checkInDate, parseInt(nights));
+            // Calculate dates affected
+            const datesToUpdate = this.getDateRange(checkInDate, nights);
 
-            let newBookedDates;
-            let newAvailable;
+            // Update booked dates
+            let newBookedDates = [...room.bookedDates];
+            if (shouldDecrease) {
+                // Add dates when booking is confirmed
+                newBookedDates = [...newBookedDates, ...datesToUpdate];
+                // Remove duplicates
+                newBookedDates = [...new Set(newBookedDates)];
+            } else {
+                // Remove dates when booking is cancelled or checked out
+                newBookedDates = newBookedDates.filter(date => !datesToUpdate.includes(date));
+            }
 
-            if (shouldBook) {
-                // Add dates to bookedDates (for confirmation)
-                newBookedDates = [...room.bookedDates, ...datesToUpdate];
+            // Update available count
+            let newAvailable = room.availableCount;
+            if (shouldDecrease) {
                 newAvailable = Math.max(0, room.availableCount - 1);
             } else {
-                // Remove dates from bookedDates (for cancellation)
-                newBookedDates = room.bookedDates.filter(date =>
-                    !datesToUpdate.includes(date)
-                );
                 newAvailable = Math.min(room.totalRooms, room.availableCount + 1);
             }
 
-            // Find room row index
+            console.log(`📊 Room ${room.name}: ${room.availableCount} → ${newAvailable} available`);
+
+            // Find room row in sheet
             const response = await this.sheets.spreadsheets.values.get({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'rooms_tab!A2:I'
+                range: `${sheetConfig.ROOMS_SHEET.sheetName}!A:I`
             });
 
             const rows = response.data.values || [];
-            const rowIndex = rows.findIndex(row => row[1] && row[1].toLowerCase() === roomType.toLowerCase());
+            const rowIndex = rows.findIndex(row =>
+                row[this.roomsColumnMap.ROOM_NAME] &&
+                row[this.roomsColumnMap.ROOM_NAME].toLowerCase() === roomType.toLowerCase()
+            );
 
             if (rowIndex === -1) {
-                console.warn(`❌ Room ${roomType} not found in sheet rows`);
+                console.warn(`❌ Room ${roomType} not found in sheet`);
                 return;
             }
 
-            // Update room in Google Sheets
-            const sheetRow = rowIndex + 2;
+            const sheetRow = rowIndex + 1; // +1 for header row
+
+            // Update in Google Sheets
             await this.sheets.spreadsheets.values.update({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: `rooms_tab!E${sheetRow}:F${sheetRow}`, // Columns E,F
+                range: `${sheetConfig.ROOMS_SHEET.sheetName}!E${sheetRow}:F${sheetRow}`,
                 valueInputOption: 'USER_ENTERED',
                 resource: {
                     values: [[
-                        newAvailable.toString(),  // Current Available (E)
-                        newBookedDates.join(',')  // Booked Dates (F)
+                        newAvailable.toString(),  // Current Available
+                        newBookedDates.join(',')  // Booked Dates
                     ]]
                 }
             });
 
-            console.log(`✅ Room ${roomType} availability ${shouldBook ? 'decreased' : 'increased'} to ${newAvailable} for booking ${bookingId}`);
+            console.log(`✅ Room ${roomType} availability updated to ${newAvailable}`);
 
         } catch (error) {
-            console.error('❌ Error updating room booked dates:', error);
+            console.error('❌ Error updating room availability:', error);
             throw error;
         }
     }
 
-    // Add these methods to GoogleSheetsService class:
-
-    // Check-in a booking (customer arrives)
+    // Check-in a booking
     async checkInBooking(bookingId, checkInTime = new Date()) {
+        await this.ensureColumnMaps();
+
         try {
-            // Find booking
-            const bookings = await this.getAllBookings();
+            const bookings = await this.getAllBookings({ includeCancelled: true });
             const booking = bookings.find(b => b.bookingId === bookingId);
 
             if (!booking) throw new Error('Booking not found');
-            if (booking.status !== 'confirmed') throw new Error('Booking not confirmed');
+            if (booking.status !== 'confirmed') {
+                throw new Error(`Booking is ${booking.status}, cannot check-in. Must be confirmed first.`);
+            }
 
-            // Update booking status
+            // Get the actual row
             const response = await this.sheets.spreadsheets.values.get({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'bookings_tab!A2:T'
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!A:Z`
             });
 
             const rows = response.data.values || [];
-            const rowIndex = rows.findIndex(row => row[0] === bookingId);
+            const rowIndex = rows.findIndex(row =>
+                row[this.bookingsColumnMap.BOOKING_ID] === bookingId
+            );
 
             if (rowIndex === -1) throw new Error('Booking not found in sheet');
 
-            // Update status to checked_in and add check-in time
+            const sheetRow = rowIndex + 1;
+            const map = this.bookingsColumnMap;
+
+            // 1. Update status to 'checked_in'
             await this.sheets.spreadsheets.values.update({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!S${rowIndex + 2}:T${rowIndex + 2}`, // Columns S,T
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.STATUS)}${sheetRow}`,
                 valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [[
-                        checkInTime.toISOString(), // Check-in At (S)
-                        '' // Check-out At empty (T)
-                    ]]
-                }
+                resource: { values: [['checked_in']] }
             });
 
-            // Log activity
+            // 2. Add check-in timestamp
+            if (map.CHECK_IN_AT !== undefined) {
+                await this.sheets.spreadsheets.values.update({
+                    auth: this.auth,
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.CHECK_IN_AT)}${sheetRow}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[checkInTime.toISOString()]] }
+                });
+            }
+
+            // 3. Log activity
             await this.logActivity({
                 date: new Date().toISOString().split('T')[0],
-                bookingId,
+                bookingId: bookingId,
                 action: 'checked_in',
-                performedBy: 'System',
+                performedBy: 'Staff',
                 details: `Customer checked in at ${checkInTime.toLocaleTimeString()}`
             });
 
             console.log(`✅ Booking ${bookingId} checked in`);
-            return { success: true, message: 'Check-in recorded' };
+            return {
+                success: true,
+                message: 'Check-in recorded successfully'
+            };
 
         } catch (error) {
-            console.error('Error during check-in:', error);
+            console.error('❌ Error during check-in:', error);
             throw error;
         }
     }
 
-    // Check-out a booking (customer leaves) - INCREMENTS ROOM AVAILABILITY
+    // Check-out a booking (THIS INCREASES ROOM AVAILABILITY!)
     async checkOutBooking(bookingId, checkOutTime = new Date()) {
+        await this.ensureColumnMaps();
+
         try {
-            // Find booking
-            const bookings = await this.getAllBookings();
+            const bookings = await this.getAllBookings({ includeCancelled: true });
             const booking = bookings.find(b => b.bookingId === bookingId);
 
             if (!booking) throw new Error('Booking not found');
-            if (booking.status !== 'confirmed') throw new Error('Booking not confirmed');
+            if (booking.status !== 'checked_in') {
+                throw new Error(`Booking is ${booking.status}, cannot check-out. Must be checked in first.`);
+            }
 
-            // Get current booking row
+            // Get the actual row
             const response = await this.sheets.spreadsheets.values.get({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'bookings_tab!A2:T'
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!A:Z`
             });
 
             const rows = response.data.values || [];
-            const rowIndex = rows.findIndex(row => row[0] === bookingId);
+            const rowIndex = rows.findIndex(row =>
+                row[this.bookingsColumnMap.BOOKING_ID] === bookingId
+            );
 
             if (rowIndex === -1) throw new Error('Booking not found in sheet');
 
-            // Update check-out time
+            const sheetRow = rowIndex + 1;
+            const map = this.bookingsColumnMap;
+
+            // 1. Update status to 'checked_out'
             await this.sheets.spreadsheets.values.update({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!T${rowIndex + 2}`, // Column T (Check-out At)
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.STATUS)}${sheetRow}`,
                 valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [[checkOutTime.toISOString()]]
-                }
+                resource: { values: [['checked_out']] }
             });
 
-            // Update status to checked_out
-            await this.sheets.spreadsheets.values.update({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: `bookings_tab!K${rowIndex + 2}`, // Column K (Status)
-                valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [['checked_out']]
-                }
-            });
+            // 2. Add check-out timestamp
+            if (map.CHECK_OUT_AT !== undefined) {
+                await this.sheets.spreadsheets.values.update({
+                    auth: this.auth,
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.CHECK_OUT_AT)}${sheetRow}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[checkOutTime.toISOString()]] }
+                });
+            }
 
-            // MOST IMPORTANT: INCREMENT ROOM AVAILABILITY
-            await this.incrementRoomAvailability(booking.roomId, booking.checkInDate, booking.nights);
+            // 3. MOST IMPORTANT: INCREASE ROOM AVAILABILITY
+            console.log(`📊 Increasing room availability for ${booking.roomType} after check-out...`);
+            await this.updateRoomAvailability(booking.roomType, booking.checkInDate, booking.nights, false);
 
-            // Log activity
+            // 4. Log activity
             await this.logActivity({
                 date: new Date().toISOString().split('T')[0],
-                bookingId,
+                bookingId: bookingId,
                 action: 'checked_out',
-                performedBy: 'System',
-                details: `Customer checked out at ${checkOutTime.toLocaleTimeString()}, room ${booking.roomType} is now available`
+                performedBy: 'Staff',
+                details: `Customer checked out at ${checkOutTime.toLocaleTimeString()}. Room ${booking.roomType} is now available.`
             });
 
-            console.log(`✅ Booking ${bookingId} checked out - Room availability updated`);
-            return { success: true, message: 'Check-out completed and room made available' };
+            console.log(`✅ Booking ${bookingId} checked out. Room availability increased.`);
+            return {
+                success: true,
+                message: 'Check-out completed and room made available'
+            };
 
         } catch (error) {
-            console.error('Error during check-out:', error);
+            console.error('❌ Error during check-out:', error);
             throw error;
         }
     }
 
-    // Increment room availability after check-out
-    async incrementRoomAvailability(roomId, checkInDate, nights) {
+    // Auto-checkout expired bookings (run this daily)
+    async autoCheckoutExpiredBookings() {
         try {
-            // Get current room data
-            const rooms = await this.getAllRooms();
-            const room = rooms.find(r => r.roomId === roomId || r.name.toLowerCase() === roomId.toLowerCase());
+            const today = new Date().toISOString().split('T')[0];
+            console.log(`🔄 Running auto-checkout for ${today}...`);
 
-            if (!room) {
-                console.warn(`Room ${roomId} not found`);
-                return;
+            // Get all checked-in bookings
+            const checkedInBookings = await this.getAllBookings({ status: 'checked_in' });
+
+            // Find bookings where check-out date is in the past
+            const expiredBookings = checkedInBookings.filter(booking => {
+                return booking.checkOutDate < today && !booking.checkOutAt;
+            });
+
+            console.log(`📊 Found ${expiredBookings.length} bookings to auto-checkout`);
+
+            const results = [];
+
+            // Auto check-out each expired booking
+            for (const booking of expiredBookings) {
+                try {
+                    console.log(`   Auto-checking out: ${booking.bookingId} (Check-out: ${booking.checkOutDate})`);
+                    await this.checkOutBooking(booking.bookingId);
+                    results.push({
+                        bookingId: booking.bookingId,
+                        success: true,
+                        message: 'Auto-checked out successfully'
+                    });
+                    console.log(`   ✅ Auto-checked out: ${booking.bookingId}`);
+                } catch (error) {
+                    console.error(`   ❌ Failed to auto-checkout ${booking.bookingId}:`, error.message);
+                    results.push({
+                        bookingId: booking.bookingId,
+                        success: false,
+                        error: error.message
+                    });
+                }
             }
 
-            // Calculate dates to free up
-            const datesToFree = this.getDateRange(checkInDate, nights);
-
-            // Remove these dates from bookedDates
-            const newBookedDates = room.bookedDates.filter(date =>
-                !datesToFree.includes(date)
-            );
-
-            // Increment available count
-            const newAvailable = Math.min(room.totalRooms, room.availableCount + 1);
-
-            // Find room row
-            const response = await this.sheets.spreadsheets.values.get({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: 'rooms_tab!A2:I'
-            });
-
-            const rows = response.data.values || [];
-            const rowIndex = rows.findIndex(row => row[0] === roomId || row[1] && row[1].toLowerCase() === room.name.toLowerCase());
-
-            if (rowIndex === -1) return;
-
-            const sheetRow = rowIndex + 2;
-
-
-
-            // Update room in Google Sheets
-            await this.sheets.spreadsheets.values.update({
-                auth: this.auth,
-                spreadsheetId: this.spreadsheetId,
-                range: `rooms_tab!E${rowIndex + 2}:F${rowIndex + 2}`, // Columns E,F
-                valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [[
-                        newAvailable.toString(), // Current Available (E)
-                        newBookedDates.join(',') // Booked Dates (F)
-                    ]]
-                }
-            });
-
-            console.log(`✅ Room ${roomId} availability incremented to ${newAvailable}`);
+            return {
+                success: true,
+                processed: expiredBookings.length,
+                successful: results.filter(r => r.success).length,
+                failed: results.filter(r => !r.success).length,
+                results: results,
+                message: `Auto-checkout completed. Processed: ${expiredBookings.length} bookings`
+            };
 
         } catch (error) {
-            console.error('Error incrementing room availability:', error);
+            console.error('❌ Error in auto-checkout:', error);
+            return {
+                success: false,
+                error: error.message
+            };
         }
     }
 
@@ -803,126 +702,233 @@ class GoogleSheetsService {
                 }
             });
         } catch (error) {
-            console.error('Error logging activity:', error);
+            console.error('❌ Error logging activity:', error);
         }
     }
 
+    // Helper to get sheet ID by name
+    async getSheetId(sheetName) {
+        const spreadsheet = await this.sheets.spreadsheets.get({
+            auth: this.auth,
+            spreadsheetId: this.spreadsheetId
+        });
 
-    // Auto-checkout expired bookings (run daily)
-    async autoCheckoutExpiredBookings() {
-        try {
-            const today = new Date().toISOString().split('T')[0];
+        const sheet = spreadsheet.data.sheets.find(s =>
+            s.properties.title === sheetName
+        );
 
-            // Get all confirmed bookings where check-out date is past
-            const bookings = await this.getAllBookings({ status: 'confirmed' });
-            const expiredBookings = bookings.filter(booking =>
-                booking.checkOutDate < today && !booking.checkOutAt
-            );
-
-            console.log(`🔄 Found ${expiredBookings.length} bookings to auto-checkout`);
-
-            // Auto check-out each expired booking
-            for (const booking of expiredBookings) {
-                try {
-                    await this.checkOutBooking(booking.bookingId);
-                    console.log(`✅ Auto-checked out: ${booking.bookingId}`);
-                } catch (error) {
-                    console.error(`❌ Failed to auto-checkout ${booking.bookingId}:`, error.message);
-                }
-            }
-
-            return {
-                success: true,
-                processed: expiredBookings.length,
-                message: `Auto-checked out ${expiredBookings.length} bookings`
-            };
-
-        } catch (error) {
-            console.error('Error in auto-checkout:', error);
-            return { success: false, error: error.message };
-        }
+        return sheet ? sheet.properties.sheetId : null;
     }
 
-    async getAllBookings(filters = {}) {
+    // Add these methods to your GoogleSheetsService class:
+
+    async getPendingBookings() {
+        await this.ensureColumnMaps();
+
         try {
             const response = await this.sheets.spreadsheets.values.get({
                 auth: this.auth,
                 spreadsheetId: this.spreadsheetId,
-                range: 'bookings_tab!A2:T'
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!A:Z`
             });
 
             const rows = response.data.values || [];
-            console.log(`📋 Found ${rows.length} bookings in sheet`);
+            const dataRows = rows.slice(1); // Skip header
+            const map = this.bookingsColumnMap;
 
-            const bookings = rows.map(row => {
-                // Map columns based on your sheet headers
-                return {
-                    bookingId: row[0] || '',                          // A: BookingID
-                    customerName: row[1] || '',                       // B: Customer Name
-                    customerPhone: row[2] || '',                      // C: Phone
-                    roomType: row[3] || '',                           // D: Room Type
-                    roomId: row[4] || '',                             // E: Room ID
-                    checkInDate: row[5] || '',                        // F: Check-in
-                    checkOutDate: row[6] || '',                       // G: Check-out
-                    nights: this.parseNights(row[7]) || 1,           // H: Nights
-                    guests: parseInt(row[8]) || 2,                    // I: Guests
-                    totalAmount: parseInt(row[9]) || 0,               // J: Total
-                    status: (row[10] || '').toLowerCase(),           // K: Status
-                    paymentStatus: row[11] || 'pending',              // L: Payment Status
-                    paymentMethod: row[12] || '',                     // M: Payment Method
-                    specialRequests: row[13] || '',                   // N: Special Reqests
-                    requestedAt: row[14] || '',                       // O: RequestedAt
-                    confirmedAt: row[15] || '',                       // P: ConfirmedAt
-                    confirmedBy: row[16] || '',                       // Q: Confirmed By
-                    checkInAt: row[17] || '',                         // R: Check-in At
-                    checkOutAt: row[18] || '',                        // S: Check-out At
-                    notes: row[19] || ''                              // T: Notes
-                };
-            });
+            return dataRows
+                .filter(row => {
+                    const status = row[map.STATUS] || '';
+                    return status.toLowerCase() === 'requested';
+                })
+                .map(row => {
+                    const get = (key, defaultValue = '') => {
+                        const index = map[key];
+                        return index !== undefined && row[index] !== undefined
+                            ? row[index]
+                            : defaultValue;
+                    };
 
-            console.log('📊 Processed bookings sample:', bookings.slice(0, 2));
-
-            // Apply filters
-            let filteredBookings = bookings;
-
-            if (filters.status) {
-                filteredBookings = filteredBookings.filter(b =>
-                    b.status.toLowerCase() === filters.status.toLowerCase()
-                );
-            }
-
-            if (filters.date) {
-                filteredBookings = filteredBookings.filter(b =>
-                    b.checkInDate === filters.date || b.checkOutDate === filters.date
-                );
-            }
-
-            if (filters.roomType) {
-                filteredBookings = filteredBookings.filter(b =>
-                    b.roomType.toLowerCase().includes(filters.roomType.toLowerCase())
-                );
-            }
-
-            if (filters.customerPhone) {
-                filteredBookings = filteredBookings.filter(b =>
-                    b.customerPhone.includes(filters.customerPhone)
-                );
-            }
-
-            // Hide cancelled by default
-            if (!filters.includeCancelled) {
-                filteredBookings = filteredBookings.filter(b => b.status !== 'cancelled');
-            }
-
-            console.log(`✅ Returning ${filteredBookings.length} filtered bookings`);
-            return filteredBookings;
-
+                    return {
+                        bookingId: get('BOOKING_ID'),
+                        customerName: get('CUSTOMER_NAME'),
+                        customerPhone: get('PHONE'),
+                        roomType: get('ROOM_TYPE'),
+                        roomId: get('ROOM_ID'),
+                        checkInDate: get('CHECK_IN'),
+                        checkOutDate: get('CHECK_OUT'),
+                        nights: this.parseNights(get('NIGHTS')),
+                        guests: parseInt(get('GUESTS')) || 1,
+                        totalAmount: parseInt(get('TOTAL')) || 0,
+                        status: get('STATUS'),
+                        paymentStatus: get('PAYMENT_STATUS') || 'pending',
+                        paymentMethod: get('PAYMENT_METHOD') || '',
+                        specialRequests: get('SPECIAL_REQUESTS') || 'No Special Requests',
+                        requestedAt: get('REQUESTED_AT')
+                    };
+                });
         } catch (error) {
-            console.error('❌ Error getting all bookings:', error);
+            console.error('❌ Error getting pending bookings:', error);
             return [];
         }
     }
 
+    async checkAvailability(roomType, checkInDate, nights = 1) {
+        try {
+            console.log(`🔍 Checking availability for: ${roomType}, ${checkInDate}, ${nights} nights`);
+
+            const rooms = await this.getAllRooms();
+            const room = rooms.find(r => {
+                const roomName = r.name.toLowerCase().trim();
+                const searchTerm = roomType.toLowerCase().trim();
+                return roomName.includes(searchTerm) || searchTerm.includes(roomName);
+            });
+
+            if (!room) {
+                return {
+                    available: false,
+                    message: `Room type "${roomType}" not found.`,
+                    availableCount: 0
+                };
+            }
+
+            const isAvailable = room.availableCount > 0;
+            return {
+                available: isAvailable,
+                availableCount: room.availableCount,
+                room: room,
+                message: isAvailable
+                    ? `✅ ${room.name} is available! ${room.availableCount} room(s) free.`
+                    : `❌ ${room.name} is not available. Only ${room.availableCount} room(s) left.`
+            };
+
+        } catch (error) {
+            console.error('❌ Error checking availability:', error);
+            return {
+                available: false,
+                message: `Error checking availability: ${error.message}`,
+                availableCount: 0
+            };
+        }
+    }
+
+    async getAllRoomsWithAvailability(checkInDate = null, nights = 1) {
+        try {
+            const rooms = await this.getAllRooms();
+
+            if (checkInDate) {
+                return await Promise.all(rooms.map(async (room) => {
+                    try {
+                        const availability = await this.checkAvailability(room.name, checkInDate, nights);
+                        return {
+                            ...room,
+                            isAvailable: availability.available,
+                            availableCount: availability.availableCount,
+                            availabilityMessage: availability.message
+                        };
+                    } catch (error) {
+                        return {
+                            ...room,
+                            isAvailable: false,
+                            availableCount: 0,
+                            availabilityMessage: `Error checking availability`
+                        };
+                    }
+                }));
+            }
+
+            return rooms.map(room => ({
+                ...room,
+                isAvailable: room.availableCount > 0,
+                availabilityMessage: room.availableCount > 0
+                    ? `✅ ${room.availableCount} available`
+                    : `❌ Booked`
+            }));
+        } catch (error) {
+            console.error('❌ Error getting rooms with availability:', error);
+            return [];
+        }
+    }
+
+    async cancelBooking(bookingId, reason = 'Cancelled by staff') {
+        await this.ensureColumnMaps();
+
+        try {
+            console.log(`❌ Cancelling booking ${bookingId}: ${reason}`);
+
+            // Find booking
+            const bookings = await this.getAllBookings({ includeCancelled: true });
+            const booking = bookings.find(b => b.bookingId === bookingId);
+
+            if (!booking) throw new Error(`Booking ${bookingId} not found`);
+
+            // Get the actual row
+            const response = await this.sheets.spreadsheets.values.get({
+                auth: this.auth,
+                spreadsheetId: this.spreadsheetId,
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!A:Z`
+            });
+
+            const rows = response.data.values || [];
+            const rowIndex = rows.findIndex(row =>
+                row[this.bookingsColumnMap.BOOKING_ID] === bookingId
+            );
+
+            if (rowIndex === -1) throw new Error('Booking not found in sheet');
+
+            const sheetRow = rowIndex + 1;
+            const map = this.bookingsColumnMap;
+
+            // Update status to 'cancelled'
+            await this.sheets.spreadsheets.values.update({
+                auth: this.auth,
+                spreadsheetId: this.spreadsheetId,
+                range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.STATUS)}${sheetRow}`,
+                valueInputOption: 'USER_ENTERED',
+                resource: { values: [['cancelled']] }
+            });
+
+            // Update notes
+            if (map.NOTES !== undefined) {
+                const note = `Cancelled: ${reason} (${new Date().toLocaleString()})`;
+                await this.sheets.spreadsheets.values.update({
+                    auth: this.auth,
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${sheetConfig.BOOKINGS_SHEET.sheetName}!${this.getColumnLetter(map.NOTES)}${sheetRow}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[note]] }
+                });
+            }
+
+            // If booking was confirmed, restore room availability
+            if (booking.status === 'confirmed') {
+                console.log(`🔄 Restoring room availability for ${booking.roomType}...`);
+                await this.updateRoomAvailability(booking.roomType, booking.checkInDate, booking.nights, false);
+            }
+
+            // Log activity
+            await this.logActivity({
+                date: new Date().toISOString().split('T')[0],
+                bookingId: bookingId,
+                action: 'cancelled',
+                performedBy: 'Staff',
+                details: `Booking cancelled: ${reason}.`
+            });
+
+            console.log(`✅ Booking ${bookingId} cancelled successfully`);
+            return {
+                success: true,
+                message: 'Booking cancelled successfully',
+                bookingId: bookingId
+            };
+
+        } catch (error) {
+            console.error('❌ Error cancelling booking:', error);
+            throw error;
+        }
+    }
+
+    // Helper method to parse nights (already used but not defined)
     parseNights(nightsValue) {
         if (!nightsValue) return 1;
 
@@ -936,13 +942,29 @@ class GoogleSheetsService {
         const nights = parseInt(nightsValue);
         return isNaN(nights) || nights < 1 || nights > 30 ? 1 : nights;
     }
-    async getBookingsByStatus(status = null) {
-        const allBookings = await this.getAllBookings();
-        if (status) {
-            return allBookings.filter(b => b.status === status);
+
+    // Helper method to get date range (already used but not defined)
+    getDateRange(startDate, nights) {
+        const dates = [];
+        const start = new Date(startDate);
+
+        for (let i = 0; i < nights; i++) {
+            const date = new Date(start);
+            date.setDate(start.getDate() + i);
+            dates.push(date.toISOString().split('T')[0]);
         }
-        return allBookings;
+
+        return dates;
     }
+
+    // Calculate check-out date
+    calculateCheckOutDate(checkInDate, nights) {
+        const date = new Date(checkInDate);
+        date.setDate(date.getDate() + nights);
+        return date.toISOString().split('T')[0];
+    }
+
+
 }
 
 module.exports = GoogleSheetsService;

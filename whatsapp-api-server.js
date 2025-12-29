@@ -15,6 +15,7 @@ class WhatsAppAPIServer {
         this.whatsappService = new WhatsAppService();
         this.aiService = new OpenAIService(this.bookingService);
         this.userSessions = new Map();
+        this.processedMessages = new Map();
         this.setupMiddleware();
         this.setupRoutes();
         this.setupErrorHandling();
@@ -102,54 +103,124 @@ class WhatsAppAPIServer {
         });
     }
 
+    // Updated processIncomingMessage method in whatsapp-api-server.js
     async processIncomingMessage(message, contact) {
         try {
             const phoneNumber = message.from;
             const messageText = message.text.body;
-            const messageId = message.id;
             const contactName = contact?.profile?.name || 'Guest';
+
+            console.log(`📥 Received message from ${phoneNumber}: "${messageText}"`);
+
             let cleanPhone = phoneNumber.replace(/\D/g, '');
 
-            if (cleanPhone.startsWith('91') && cleanPhone.length === 12) {
-                cleanPhone = cleanPhone;
-            } else if (cleanPhone.length === 10) {
+            if (cleanPhone.length === 10) {
                 cleanPhone = `91${cleanPhone}`;
-            } else if (cleanPhone.startsWith('975') && cleanPhone.length === 11) {
-                cleanPhone = cleanPhone;
             }
+
+            // Get AI response
             const aiResponse = await this.aiService.getAIResponse(cleanPhone, messageText);
 
-            if (aiResponse && aiResponse.trim()) {
-                const sendResult = await this.whatsappService.sendTextMessage(phoneNumber, aiResponse);
+            // 🧠 Check if AI returned a booking ready signal
+            if (aiResponse && aiResponse.startsWith('BOOKING_READY:')) {
+                console.log('📥 Processing booking ready signal...');
 
-                if (sendResult.success) {
-                    console.log(`✅ Response sent to ${phoneNumber}`);
+                try {
+                    // Extract booking details
+                    const bookingJson = aiResponse.replace('BOOKING_READY:', '');
+                    const bookingData = JSON.parse(bookingJson);
+
+                    console.log('📋 Booking details:', bookingData);
+
+                    // Add phone and create booking
+                    const bookingPayload = {
+                        ...bookingData,
+                        customerPhone: cleanPhone,
+                        source: 'whatsapp',
+                        status: 'requested',
+                        createdAt: new Date().toISOString()
+                    };
+
+                    const result = await this.bookingService.createBookingRequest(bookingPayload);
+
+                    console.log('✅ Booking created:', result?.booking?.bookingId);
+
+                    // Send confirmation
+                    const confirmationMsg = `✅ *Booking Request Submitted!*\n\n📋 Request ID: *${result.booking.bookingId}*\n👤 Name: *${bookingData.customerName}*\n🏨 Room(s): *${bookingData.roomType}*\n📅 Check-in: *${bookingData.checkInDate}*\n📅 Check-out: *${bookingData.checkOutDate}*\n🌙 Nights: *${bookingData.nights}*\n👥 Guests: *${bookingData.guests}*\n\n*Important:* Our staff will call you within 30 minutes to confirm.`;
+
+                    await this.whatsappService.sendTextMessage(phoneNumber, confirmationMsg);
+                    return;
+
+                } catch (parseError) {
+                    console.error('❌ Error parsing booking data:', parseError);
+                    await this.whatsappService.sendTextMessage(
+                        phoneNumber,
+                        "Sorry, there was an error processing your booking. Please try again."
+                    );
+                    return;
+                }
+            }
+
+            // 🧠 Send AI reply ONLY if we got a valid response
+            if (aiResponse && aiResponse.trim() !== '') {
+                console.log(`📤 Sending reply to ${phoneNumber}:`, aiResponse.substring(0, 100) + '...');
+
+                const result = await this.whatsappService.sendTextMessage(phoneNumber, aiResponse);
+
+                if (result.success) {
+                    console.log(`✅ Reply sent successfully to ${phoneNumber}`);
                 } else {
-                    console.error(`❌ Failed to send to ${phoneNumber}:`, sendResult.error);
+                    console.error(`❌ Failed to send reply to ${phoneNumber}:`, result.error);
                 }
             } else {
-                console.error(`❌ Empty AI response for ${phoneNumber}`);
-                // Send fallback message
-                await this.whatsappService.sendTextMessage(
-                    phoneNumber,
-                    "I apologize, but I couldn't generate a response. Please try rephrasing your question."
-                );
+                console.log(`ℹ️ AI returned empty response - skipping send`);
             }
 
+            // ... rest of existing code ...
         } catch (error) {
             console.error('❌ Error processing message:', error);
-
-            // Try to send error message
-            try {
-                await this.whatsappService.sendTextMessage(
-                    message.from,
-                    "Sorry, I'm experiencing technical difficulties. Our team has been notified."
-                );
-            } catch (sendError) {
-                console.error('❌ Also failed to send error message:', sendError);
-            }
         }
     }
+
+    shouldCreateBooking(phoneNumber, userMessage, aiReply) {
+        const lowerMessage = userMessage.toLowerCase();
+        const lowerAiReply = aiReply.toLowerCase();
+
+        // User explicitly confirmed
+        const confirmationKeywords = ['confirm', 'yes', 'proceed', 'book now', 'go ahead'];
+        const isConfirming = confirmationKeywords.some(keyword =>
+            lowerMessage.includes(keyword) && !lowerMessage.includes('not')
+        );
+
+        // AI asked for confirmation in previous message
+        const userSession = this.aiService.bookingIntents.get(phoneNumber);
+        const aiAskedForConfirmation = lowerAiReply.includes('type confirm') ||
+            lowerAiReply.includes('please confirm') ||
+            lowerAiReply.includes('proceed with booking');
+
+        // Check if we have enough information
+        const hasEnoughInfo = userSession && (
+            (userSession.type === 'people_count' && userSession.selectedOption) ||
+            (userSession.type === 'room_specification')
+        );
+
+        return isConfirming && aiAskedForConfirmation && hasEnoughInfo;
+    }
+
+    formatPhoneForDisplay(phone) {
+        if (!phone) return 'N/A';
+
+        const digits = phone.toString().replace(/\D/g, '');
+
+        if (digits.length === 12 && digits.startsWith('91')) {
+            return `+${digits.substring(0, 2)} ${digits.substring(2, 7)} ${digits.substring(7)}`;
+        } else if (digits.length === 10) {
+            return `+91 ${digits.substring(0, 5)} ${digits.substring(5)}`;
+        }
+
+        return `+${digits}`;
+    }
+
 
     setupErrorHandling() {
         // Global error handler
@@ -160,19 +231,25 @@ class WhatsAppAPIServer {
     }
 
     async start() {
-        try {
-            // Start Express server
-            this.server = this.app.listen(this.port, () => {
-                console.log(`✅ WhatsApp API Server running on port ${this.port}`);
-            });
+        return new Promise((resolve, reject) => {
+            try {
+                this.server = this.app.listen(this.port, () => {
+                    console.log(`✅ WhatsApp API Server running on port ${this.port}`);
+                    console.log(`🌐 Webhook URL: http://localhost:${this.port}/webhook`);
+                    resolve(this.server);
+                });
 
+                this.server.on('error', (err) => {
+                    console.error('❌ Server error:', err);
+                    reject(err);
+                });
 
-        } catch (error) {
-            console.error('❌ Failed to start server:', error);
-            process.exit(1);
-        }
+            } catch (error) {
+                console.error('❌ Failed to start server:', error);
+                reject(error);
+            }
+        });
     }
-
     async startNgrok() {
         try {
             const url = await ngrok.connect({

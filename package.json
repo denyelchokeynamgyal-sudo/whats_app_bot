@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node whatsapp-api-server.js",
     "dashboard": "node employee-dashboard.js",
-    "dev": "concurrently \"npm run start\" \"npm run dashboard\""
+    "dev": "concurrently \"npm run start\" \"npm run dashboard\"",
+    "auto-checkout": "node scripts/auto-checkout-cron.js",
+    "setup": "node scripts/setup-google-sheet.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
@@ -17,8 +19,8 @@
     "express": "^4.22.1",
     "googleapis": "^128.0.0",
     "ngrok": "^5.0.0-beta.2",
-    "openai": "^4.28.0",
-    "whatsapp": "^0.0.5-Alpha"
+    "node-cron": "^4.2.1",
+    "openai": "^4.28.0"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

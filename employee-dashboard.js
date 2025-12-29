@@ -12,7 +12,7 @@ app.use(express.static('public'));
 // Simple auth
 const authenticate = (req, res, next) => {
     const authToken = req.headers.authorization;
-    if (authToken === 'hotel-staff-2024') {
+    if (authToken === process.env.DASHBOARD_AUTH_TOKEN) {
         next();
     } else {
         res.status(401).json({ error: 'Unauthorized' });
